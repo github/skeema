@@ -14,6 +14,7 @@ type Printer struct {
 	lastStdoutInstance string
 	lastStdoutSchema   string
 	seenInstance       map[string]bool
+	wrapperComments    bool
 	*sync.Mutex
 }
 
@@ -21,11 +22,12 @@ type Printer struct {
 // printer is used to print instance names ("host:port\n") of instances that
 // have one or more differences found. If briefMode is false, this printer is
 // used to print any arbitrary output specific to an instance and schema.
-func NewPrinter(briefMode bool) *Printer {
+func NewPrinter(briefMode bool, wrapperComments bool) *Printer {
 	return &Printer{
-		briefOutput:  briefMode,
-		seenInstance: make(map[string]bool),
-		Mutex:        new(sync.Mutex),
+		briefOutput:     briefMode,
+		seenInstance:    make(map[string]bool),
+		wrapperComments: wrapperComments,
+		Mutex:           new(sync.Mutex),
 	}
 }
 
@@ -56,5 +58,11 @@ func (p *Printer) printDDL(ddl *DDLStatement) {
 		fmt.Printf("USE %s;\n", tengo.EscapeIdentifier(ddl.schemaName))
 		p.lastStdoutSchema = ddl.schemaName
 	}
+	if p.wrapperComments {
+		fmt.Print("-- skeema:ddl:begin\n")
+	}
 	fmt.Print(ddl.String())
+	if p.wrapperComments {
+		fmt.Print("-- skeema:ddl:end\n")
+	}
 }
