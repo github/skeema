@@ -63,13 +63,13 @@ func (t *Target) logApplyStart() {
 
 func (t *Target) logApplyEnd(result Result) {
 	if result.Differences {
-		log.Infof("%s %s: No differences found\n", t.Instance, t.SchemaName)
-	} else {
 		verb := "push"
 		if t.dryRun() {
 			verb = "diff"
 		}
 		log.Infof("%s %s: %s complete\n", t.Instance, t.SchemaName, verb)
+	} else {
+		log.Infof("%s %s: No differences found\n", t.Instance, t.SchemaName)
 	}
 }
 
@@ -105,7 +105,7 @@ type TargetGroup []*Target
 // fatal; a count of skipped dirs is returned instead.
 func TargetsForDir(dir *fs.Dir, maxDepth int) (targets []*Target, skipCount int) {
 	if dir.ParseError != nil {
-		log.Warnf("Skipping %s: %s", dir.Path, dir.ParseError)
+		log.Warnf("Skipping %s: %s\n", dir.Path, dir.ParseError)
 		return nil, 1
 	}
 	if dir.Config.Changed("host") && dir.HasSchema() {
