@@ -14,7 +14,7 @@ import (
 	"github.com/VividCortex/mysqlerr"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
-	"golang.org/x/sync/errgroup"
+	"github.com/nozzle/throttler"
 )
 
 // Instance represents a single database server running on a specific host or address.
@@ -31,6 +31,7 @@ type Instance struct {
 	*sync.RWMutex                      // protects connectionPool for concurrent operations
 	flavor         Flavor
 	version        [3]int
+	grants         []string
 }
 
 // NewInstance returns a pointer to a new Instance corresponding to the
@@ -66,8 +67,6 @@ func NewInstance(driver, dsn string) (*Instance, error) {
 	case "unix":
 		instance.Host = "localhost"
 		instance.SocketPath = parsedConfig.Addr
-	case "cloudsql":
-		instance.Host = parsedConfig.Addr
 	default:
 		instance.Host, instance.Port, err = SplitHostOptionalPort(parsedConfig.Addr)
 		if err != nil {
@@ -253,6 +252,31 @@ func (instance *Instance) hydrateFlavorAndVersion() {
 	}
 	instance.version = ParseVersion(versionString)
 	instance.flavor = ParseFlavor(versionString, versionComment)
+}
+
+var reSkipBinlog = regexp.MustCompile(`(?:ALL PRIVILEGES|SUPER|SESSION_VARIABLES_ADMIN|SYSTEM_VARIABLES_ADMIN)[,\s]`)
+
+// CanSkipBinlog returns true if instance.User has privileges necessary to
+// set sql_log_bin=0. If an error occurs in checking grants, this method returns
+// false as a safe fallback.
+func (instance *Instance) CanSkipBinlog() bool {
+	if instance.grants == nil {
+		instance.hydrateGrants()
+	}
+	for _, grant := range instance.grants {
+		if reSkipBinlog.MatchString(grant) {
+			return true
+		}
+	}
+	return false
+}
+
+func (instance *Instance) hydrateGrants() {
+	db, err := instance.Connect("", "")
+	if err != nil {
+		return
+	}
+	db.Select(&instance.grants, "SHOW GRANTS")
 }
 
 // SchemaNames returns a slice of all schema name strings on the instance
@@ -444,33 +468,65 @@ func tableHasRows(db *sqlx.DB, table string) (bool, error) {
 	return len(result) != 0, nil
 }
 
+func confirmTablesEmpty(db *sqlx.DB, tables []string) error {
+	th := throttler.New(15, len(tables))
+	for _, name := range tables {
+		go func(name string) {
+			hasRows, err := tableHasRows(db, name)
+			if err == nil && hasRows {
+				err = fmt.Errorf("table %s has at least one row", EscapeIdentifier(name))
+			}
+			th.Done(err)
+		}(name)
+		if th.Throttle() > 0 {
+			return th.Errs()[0]
+		}
+	}
+	return nil
+}
+
+// SchemaCreationOptions specifies schema-level metadata when creating or
+// altering a database.
+type SchemaCreationOptions struct {
+	DefaultCharSet   string
+	DefaultCollation string
+	SkipBinlog       bool
+}
+
+func (opts SchemaCreationOptions) params() string {
+	if opts.SkipBinlog {
+		return "sql_log_bin=0"
+	}
+	return ""
+}
+
 // CreateSchema creates a new database schema with the supplied name, and
-// optionally the supplied default charSet and collation. (Leave charSet and
-// collation blank to use server defaults.)
-func (instance *Instance) CreateSchema(name, charSet, collation string) (*Schema, error) {
-	db, err := instance.Connect("", "")
+// optionally the supplied default CharSet and Collation. (Leave these fields
+// blank to use server defaults.)
+func (instance *Instance) CreateSchema(name string, opts SchemaCreationOptions) (*Schema, error) {
+	db, err := instance.Connect("", opts.params())
 	if err != nil {
 		return nil, err
 	}
 	// Technically the server defaults would be used anyway if these are left
 	// blank, but we need the returned Schema value to reflect the correct values,
 	// and we can avoid re-querying this way
-	if charSet == "" || collation == "" {
+	if opts.DefaultCharSet == "" || opts.DefaultCollation == "" {
 		defCharSet, defCollation, err := instance.DefaultCharSetAndCollation()
 		if err != nil {
 			return nil, err
 		}
-		if charSet == "" {
-			charSet = defCharSet
+		if opts.DefaultCharSet == "" {
+			opts.DefaultCharSet = defCharSet
 		}
-		if collation == "" {
-			collation = defCollation
+		if opts.DefaultCollation == "" {
+			opts.DefaultCollation = defCollation
 		}
 	}
 	schema := &Schema{
 		Name:      name,
-		CharSet:   charSet,
-		Collation: collation,
+		CharSet:   opts.DefaultCharSet,
+		Collation: opts.DefaultCollation,
 		Tables:    []*Table{},
 	}
 	_, err = db.Exec(schema.CreateStatement())
@@ -481,10 +537,10 @@ func (instance *Instance) CreateSchema(name, charSet, collation string) (*Schema
 }
 
 // DropSchema first drops all tables in the schema, and then drops the database
-// schema itself. If onlyIfEmpty==true, returns an error if any of the tables
-// have any rows.
-func (instance *Instance) DropSchema(schema string, onlyIfEmpty bool) error {
-	err := instance.DropTablesInSchema(schema, onlyIfEmpty)
+// schema itself. If opts.OnlyIfEmpty==true, returns an error if any of the
+// tables have any rows.
+func (instance *Instance) DropSchema(schema string, opts BulkDropOptions) error {
+	err := instance.DropTablesInSchema(schema, opts)
 	if err != nil {
 		return err
 	}
@@ -495,7 +551,7 @@ func (instance *Instance) DropSchema(schema string, onlyIfEmpty bool) error {
 	s := &Schema{
 		Name: schema,
 	}
-	db, err := instance.Connect("", "")
+	db, err := instance.Connect("", opts.params())
 	if err != nil {
 		return err
 	}
@@ -517,20 +573,20 @@ func (instance *Instance) DropSchema(schema string, onlyIfEmpty bool) error {
 }
 
 // AlterSchema changes the character set and/or collation of the supplied schema
-// on instance. Supply an empty string for newCharSet to only change the
-// collation, or supply an empty string for newCollation to use the default
-// collation of newCharSet. (Supplying an empty string for both is also allowed,
-// but is a no-op.)
-func (instance *Instance) AlterSchema(schema, newCharSet, newCollation string) error {
+// on instance. Supply an empty string for opts.DefaultCharSet to only change
+// the collation, or supply an empty string for opts.DefaultCollation to use the
+// default collation of opts.DefaultCharSet. (Supplying an empty string for both
+// is also allowed, but is a no-op.)
+func (instance *Instance) AlterSchema(schema string, opts SchemaCreationOptions) error {
 	s, err := instance.Schema(schema)
 	if err != nil {
 		return err
 	}
-	statement := s.AlterStatement(newCharSet, newCollation)
+	statement := s.AlterStatement(opts.DefaultCharSet, opts.DefaultCollation)
 	if statement == "" {
 		return nil
 	}
-	db, err := instance.Connect("", "")
+	db, err := instance.Connect("", opts.params())
 	if err != nil {
 		return err
 	}
@@ -540,72 +596,179 @@ func (instance *Instance) AlterSchema(schema, newCharSet, newCollation string) e
 	return nil
 }
 
-// DropTablesInSchema drops all tables in a schema. If onlyIfEmpty==true,
+// BulkDropOptions controls how objects are dropped in bulk.
+type BulkDropOptions struct {
+	OnlyIfEmpty     bool // If true, when dropping tables, error if any have rows
+	MaxConcurrency  int  // Max objects to drop at once
+	SkipBinlog      bool // If true, use session sql_log_bin=0 (requires superuser)
+	PartitionsFirst bool // If true, drop RANGE/LIST partitioned tables one partition at a time
+}
+
+func (opts BulkDropOptions) params() string {
+	if opts.SkipBinlog {
+		return "foreign_key_checks=0&sql_log_bin=0"
+	}
+	return "foreign_key_checks=0"
+}
+
+// Concurrency returns the concurrency, with a minimum value of 1.
+func (opts BulkDropOptions) Concurrency() int {
+	if opts.MaxConcurrency < 1 {
+		return 1
+	}
+	return opts.MaxConcurrency
+}
+
+// DropTablesInSchema drops all tables in a schema. If opts.OnlyIfEmpty==true,
 // returns an error if any of the tables have any rows.
-func (instance *Instance) DropTablesInSchema(schema string, onlyIfEmpty bool) error {
-	db, err := instance.Connect(schema, "foreign_key_checks=0")
+func (instance *Instance) DropTablesInSchema(schema string, opts BulkDropOptions) error {
+	db, err := instance.Connect(schema, opts.params())
 	if err != nil {
 		return err
 	}
 
-	// Obtain table names directly; faster than going through instance.Schema(schema)
-	// since we don't need other info besides the names
-	var names []string
-	query := `
-		SELECT table_name
-		FROM   information_schema.tables
-		WHERE  table_schema = ?
-		AND    table_type = 'BASE TABLE'`
-	if err := db.Select(&names, query, schema); err != nil {
+	// Obtain table and partition names
+	tableMap, err := tablesToPartitions(db, schema)
+	if err != nil {
 		return err
-	} else if len(names) == 0 {
+	} else if len(tableMap) == 0 {
 		return nil
 	}
 
-	var g errgroup.Group
-	defer db.SetMaxOpenConns(0)
-
-	if onlyIfEmpty {
-		db.SetMaxOpenConns(15)
-		for _, name := range names {
-			name := name
-			g.Go(func() error {
-				hasRows, err := tableHasRows(db, name)
-				if err == nil && hasRows {
-					err = fmt.Errorf("DropTablesInSchema: table %s.%s has at least one row", EscapeIdentifier(schema), EscapeIdentifier(name))
-				}
-				return err
-			})
+	// If requested, confirm tables are empty
+	if opts.OnlyIfEmpty {
+		names := make([]string, 0, len(tableMap))
+		for tableName := range tableMap {
+			names = append(names, tableName)
 		}
-		if err := g.Wait(); err != nil {
+		if err := confirmTablesEmpty(db, names); err != nil {
 			return err
 		}
 	}
 
-	db.SetMaxOpenConns(10)
-	retries := make(chan string, len(names))
-	for _, name := range names {
-		name := name
-		g.Go(func() error {
-			_, err := db.Exec(fmt.Sprintf("DROP TABLE %s", EscapeIdentifier(name)))
-			// With the new data dictionary added in MySQL 8.0, attempting to
-			// concurrently drop two tables that have a foreign key constraint between
-			// them can deadlock.
-			if IsDatabaseError(err, mysqlerr.ER_LOCK_DEADLOCK) {
-				retries <- name
-				err = nil
+	th := throttler.New(opts.Concurrency(), len(tableMap))
+	retries := make(chan string, len(tableMap))
+	for name, partitions := range tableMap {
+		go func(name string, partitions []string) {
+			var err error
+			if len(partitions) > 1 && opts.PartitionsFirst {
+				err = dropPartitions(db, name, partitions[0:len(partitions)-1])
 			}
-			return err
-		})
+			if err == nil {
+				_, err := db.Exec(fmt.Sprintf("DROP TABLE %s", EscapeIdentifier(name)))
+				// With the new data dictionary added in MySQL 8.0, attempting to
+				// concurrently drop two tables that have a foreign key constraint between
+				// them can deadlock.
+				if IsDatabaseError(err, mysqlerr.ER_LOCK_DEADLOCK) {
+					retries <- name
+					err = nil
+				}
+			}
+			th.Done(err)
+		}(name, partitions)
+		th.Throttle()
 	}
-	err = g.Wait()
 	close(retries)
 	for name := range retries {
 		if _, err := db.Exec(fmt.Sprintf("DROP TABLE %s", EscapeIdentifier(name))); err != nil {
 			return err
 		}
 	}
-	return err
+	if errs := th.Errs(); len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
+}
+
+// DropRoutinesInSchema drops all stored procedures and functions in a schema.
+func (instance *Instance) DropRoutinesInSchema(schema string, opts BulkDropOptions) error {
+	db, err := instance.Connect(schema, opts.params())
+	if err != nil {
+		return err
+	}
+
+	// Obtain names and types directly; faster than going through
+	// instance.Schema(schema) since we don't need other introspection
+	var routineInfo []struct {
+		Name string `db:"routine_name"`
+		Type string `db:"routine_type"`
+	}
+	query := `
+		SELECT routine_name AS routine_name, UPPER(routine_type) AS routine_type
+		FROM   information_schema.routines
+		WHERE  routine_schema = ?`
+	if err := db.Select(&routineInfo, query, schema); err != nil {
+		return err
+	} else if len(routineInfo) == 0 {
+		return nil
+	}
+
+	th := throttler.New(opts.Concurrency(), len(routineInfo))
+	for _, ri := range routineInfo {
+		go func(name, typ string) {
+			_, err := db.Exec(fmt.Sprintf("DROP %s %s", typ, EscapeIdentifier(name)))
+			th.Done(err)
+		}(ri.Name, ri.Type)
+		th.Throttle()
+	}
+	if errs := th.Errs(); len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
+}
+
+// tablesToPartitions returns a map whose keys are all tables in the schema
+// (whether partitioned or not), and values are either nil (if unpartitioned or
+// partitioned in a way that doesn't support DROP PARTITION) or a slice of
+// partition names (if using RANGE or LIST partitioning). Views are excluded
+// from the result.
+func tablesToPartitions(db *sqlx.DB, schema string) (map[string][]string, error) {
+	// information_schema.partitions contains all tables (not just partitioned)
+	// and excludes views (which we don't want here anyway)
+	var rawNames []struct {
+		TableName     string         `db:"table_name"`
+		PartitionName sql.NullString `db:"partition_name"`
+		Method        sql.NullString `db:"partition_method"`
+		SubMethod     sql.NullString `db:"subpartition_method"`
+		Position      sql.NullInt64  `db:"partition_ordinal_position"`
+	}
+	// Explicit AS clauses needed for compatibility with MySQL 8 data dictionary,
+	// otherwise results come back with uppercase col names, breaking Select
+	query := `
+		SELECT   p.table_name AS table_name, p.partition_name AS partition_name,
+		         p.partition_method AS partition_method,
+		         p.subpartition_method AS subpartition_method,
+		         p.partition_ordinal_position AS partition_ordinal_position
+		FROM     information_schema.partitions p
+		WHERE    p.table_schema = ?
+		ORDER BY p.table_name, p.partition_ordinal_position`
+	if err := db.Select(&rawNames, query, schema); err != nil {
+		return nil, err
+	}
+
+	partitions := make(map[string][]string)
+	for _, rn := range rawNames {
+		if !rn.Position.Valid || rn.Position.Int64 == 1 {
+			partitions[rn.TableName] = nil
+		}
+		if rn.Method.Valid && !rn.SubMethod.Valid &&
+			(strings.HasPrefix(rn.Method.String, "RANGE") || strings.HasPrefix(rn.Method.String, "LIST")) {
+			partitions[rn.TableName] = append(partitions[rn.TableName], rn.PartitionName.String)
+		}
+	}
+	return partitions, nil
+}
+
+func dropPartitions(db *sqlx.DB, table string, partitions []string) error {
+	for _, partName := range partitions {
+		_, err := db.Exec(fmt.Sprintf("ALTER TABLE %s DROP PARTITION %s",
+			EscapeIdentifier(table),
+			EscapeIdentifier(partName)))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // DefaultCharSetAndCollation returns the instance's default character set and
@@ -651,7 +814,7 @@ func (instance *Instance) StrictModeCompliant(schemas []*Schema) (bool, error) {
 		for _, t := range s.Tables {
 			for _, c := range t.Columns {
 				if strings.HasPrefix(c.TypeInDB, "timestamp") || strings.HasPrefix(c.TypeInDB, "date") {
-					if strings.HasPrefix(c.Default.Value, "0000-00-00") {
+					if strings.HasPrefix(c.Default, "'0000-00-00") {
 						return false, nil
 					}
 				}
@@ -684,6 +847,7 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 	// Obtain flavor and version info. MariaDB changed how default values are
 	// represented in information_schema in 10.2+.
 	flavor := instance.Flavor()
+	_, _, patch := instance.Version()
 
 	// Note on these queries: MySQL 8.0 changes information_schema column names to
 	// come back from queries in all caps, so we need to explicitly use AS clauses
@@ -704,7 +868,7 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 	query := `
 		SELECT t.table_name AS table_name, t.table_type AS table_type, t.engine AS engine,
 		       t.auto_increment AS auto_increment, t.table_collation AS table_collation,
-		       UPPER(t.create_options) AS create_options, t.table_comment AS table_comment,
+		       t.create_options AS create_options, t.table_comment AS table_comment,
 		       c.character_set_name AS character_set_name, c.is_default AS is_default
 		FROM   tables t
 		JOIN   collations c ON t.table_collation = c.collation_name
@@ -717,6 +881,7 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		return []*Table{}, nil
 	}
 	tables := make([]*Table, len(rawTables))
+	var havePartitions bool
 	for n, rawTable := range rawTables {
 		tables[n] = &Table{
 			Name:               rawTable.Name,
@@ -729,17 +894,11 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		if rawTable.AutoIncrement.Valid {
 			tables[n].NextAutoIncrement = uint64(rawTable.AutoIncrement.Int64)
 		}
-		if rawTable.CreateOptions.Valid && rawTable.CreateOptions.String != "" && rawTable.CreateOptions.String != "PARTITIONED" {
-			// information_schema.tables.create_options annoyingly contains "partitioned"
-			// if the table is partitioned, despite this not being present as-is in the
-			// table table definition. All other create_options are present verbatim.
-			// Currently in mysql-server/sql/sql_show.cc, it's always at the *end* of
-			// create_options... but just to code defensively we handle any location.
-			if strings.HasPrefix(rawTable.CreateOptions.String, "PARTITIONED ") {
-				tables[n].CreateOptions = strings.Replace(rawTable.CreateOptions.String, "PARTITIONED ", "", 1)
-			} else {
-				tables[n].CreateOptions = strings.Replace(rawTable.CreateOptions.String, " PARTITIONED", "", 1)
+		if rawTable.CreateOptions.Valid && rawTable.CreateOptions.String != "" {
+			if strings.Contains(strings.ToUpper(rawTable.CreateOptions.String), "PARTITIONED") {
+				havePartitions = true
 			}
+			tables[n].CreateOptions = reformatCreateOptions(rawTable.CreateOptions.String)
 		}
 	}
 
@@ -751,6 +910,7 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		IsNullable         string         `db:"is_nullable"`
 		Default            sql.NullString `db:"column_default"`
 		Extra              string         `db:"extra"`
+		GenerationExpr     sql.NullString `db:"generation_expression"`
 		Comment            string         `db:"column_comment"`
 		CharSet            sql.NullString `db:"character_set_name"`
 		Collation          sql.NullString `db:"collation_name"`
@@ -760,6 +920,7 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		SELECT    c.table_name AS table_name, c.column_name AS column_name,
 		          c.column_type AS column_type, c.is_nullable AS is_nullable,
 		          c.column_default AS column_default, c.extra AS extra,
+		          %s AS generation_expression,
 		          c.column_comment AS column_comment,
 		          c.character_set_name AS character_set_name,
 		          c.collation_name AS collation_name, co.is_default AS is_default
@@ -767,11 +928,15 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		LEFT JOIN collations co ON co.collation_name = c.collation_name
 		WHERE     c.table_schema = ?
 		ORDER BY  c.table_name, c.ordinal_position`
+	genExpr := "NULL"
+	if flavor.GeneratedColumns() {
+		genExpr = "c.generation_expression"
+	}
+	query = fmt.Sprintf(query, genExpr)
 	if err := db.Select(&rawColumns, query, schema); err != nil {
 		return nil, fmt.Errorf("Error querying information_schema.columns for schema %s: %s", schema, err)
 	}
 	columnsByTableName := make(map[string][]*Column)
-	columnsByTableAndName := make(map[string]*Column)
 	for _, rawColumn := range rawColumns {
 		col := &Column{
 			Name:          rawColumn.Name,
@@ -779,27 +944,35 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 			Nullable:      strings.ToUpper(rawColumn.IsNullable) == "YES",
 			AutoIncrement: strings.Contains(rawColumn.Extra, "auto_increment"),
 			Comment:       rawColumn.Comment,
+			Invisible:     strings.Contains(rawColumn.Extra, "INVISIBLE"),
+		}
+		if rawColumn.GenerationExpr.Valid {
+			col.GenerationExpr = rawColumn.GenerationExpr.String
+			col.Virtual = strings.Contains(rawColumn.Extra, "VIRTUAL GENERATED")
 		}
 		if !rawColumn.Default.Valid {
-			col.Default = ColumnDefaultNull
+			allowNullDefault := col.Nullable && !col.AutoIncrement && col.GenerationExpr == ""
+			if !flavor.AllowBlobDefaults() && (strings.HasSuffix(col.TypeInDB, "blob") || strings.HasSuffix(col.TypeInDB, "text")) {
+				allowNullDefault = false
+			}
+			if allowNullDefault {
+				col.Default = "NULL"
+			}
 		} else if flavor.VendorMinVersion(VendorMariaDB, 10, 2) {
-			if rawColumn.Default.String[0] == '\'' {
-				col.Default = ColumnDefaultValue(strings.Trim(rawColumn.Default.String, "'"))
-			} else if rawColumn.Default.String == "NULL" {
-				col.Default = ColumnDefaultNull
-			} else {
-				col.Default = ColumnDefaultExpression(rawColumn.Default.String)
+			if !col.AutoIncrement && col.GenerationExpr == "" {
+				// MariaDB 10.2+ exposes defaults as expressions / quote-wrapped strings
+				col.Default = rawColumn.Default.String
 			}
 		} else if strings.HasPrefix(rawColumn.Default.String, "CURRENT_TIMESTAMP") && (strings.HasPrefix(rawColumn.Type, "timestamp") || strings.HasPrefix(rawColumn.Type, "datetime")) {
-			col.Default = ColumnDefaultExpression(rawColumn.Default.String)
+			col.Default = rawColumn.Default.String
 		} else if strings.HasPrefix(rawColumn.Type, "bit") && strings.HasPrefix(rawColumn.Default.String, "b'") {
-			col.Default = ColumnDefaultExpression(rawColumn.Default.String)
+			col.Default = rawColumn.Default.String
 		} else if strings.Contains(rawColumn.Extra, "DEFAULT_GENERATED") && strings.HasPrefix(rawColumn.Default.String, "(") {
 			// MySQL/Percona 8.0.13+ added default expressions, which are single-paren-
 			// wrapped in information_schema, but double-paren-wrapped in SHOW CREATE
-			col.Default = ColumnDefaultExpression(fmt.Sprintf("(%s)", rawColumn.Default.String))
+			col.Default = fmt.Sprintf("(%s)", rawColumn.Default.String)
 		} else {
-			col.Default = ColumnDefaultValue(rawColumn.Default.String)
+			col.Default = fmt.Sprintf("'%s'", EscapeValueForCreateTable(rawColumn.Default.String))
 		}
 		if matches := reExtraOnUpdate.FindStringSubmatch(rawColumn.Extra); matches != nil {
 			col.OnUpdate = matches[1]
@@ -818,8 +991,6 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 			columnsByTableName[rawColumn.TableName] = make([]*Column, 0)
 		}
 		columnsByTableName[rawColumn.TableName] = append(columnsByTableName[rawColumn.TableName], col)
-		fullNameStr := fmt.Sprintf("%s.%s.%s", schema, rawColumn.TableName, rawColumn.Name)
-		columnsByTableAndName[fullNameStr] = col
 	}
 	for n, t := range tables {
 		// Put the columns into the table
@@ -841,18 +1012,31 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		TableName  string         `db:"table_name"`
 		NonUnique  uint8          `db:"non_unique"`
 		SeqInIndex uint8          `db:"seq_in_index"`
-		ColumnName string         `db:"column_name"`
+		ColumnName sql.NullString `db:"column_name"`
 		SubPart    sql.NullInt64  `db:"sub_part"`
 		Comment    sql.NullString `db:"index_comment"`
 		Type       string         `db:"index_type"`
+		Collation  sql.NullString `db:"collation"`
+		Expression sql.NullString `db:"expression"`
+		Visible    string         `db:"is_visible"`
 	}
 	query = `
 		SELECT   index_name AS index_name, table_name AS table_name,
 		         non_unique AS non_unique, seq_in_index AS seq_in_index,
 		         column_name AS column_name, sub_part AS sub_part,
-		         index_comment AS index_comment, index_type AS index_type
+		         index_comment AS index_comment, index_type AS index_type,
+		         collation AS collation, %s AS expression, %s AS is_visible
 		FROM     statistics
 		WHERE    table_schema = ?`
+	exprSelect, visSelect := "NULL", "'YES'"
+	if flavor.MySQLishMinVersion(8, 0) {
+		// Index expressions added in 8.0.13
+		if patch >= 13 || flavor.MySQLishMinVersion(8, 1) {
+			exprSelect = "expression"
+		}
+		visSelect = "is_visible" // available in all 8.0
+	}
+	query = fmt.Sprintf(query, exprSelect, visSelect)
 	if err := db.Select(&rawIndexes, query, schema); err != nil {
 		return nil, fmt.Errorf("Error querying information_schema.statistics for schema %s: %s", schema, err)
 	}
@@ -864,12 +1048,11 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 			continue
 		}
 		index := &Index{
-			Name:     rawIndex.Name,
-			Unique:   rawIndex.NonUnique == 0,
-			Columns:  make([]*Column, 0),
-			SubParts: make([]uint16, 0),
-			Comment:  rawIndex.Comment.String,
-			Type:     rawIndex.Type,
+			Name:      rawIndex.Name,
+			Unique:    rawIndex.NonUnique == 0,
+			Comment:   rawIndex.Comment.String,
+			Type:      rawIndex.Type,
+			Invisible: (rawIndex.Visible == "NO"),
 		}
 		if strings.ToUpper(index.Name) == "PRIMARY" {
 			primaryKeyByTableName[rawIndex.TableName] = index
@@ -889,18 +1072,14 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		if !ok {
 			panic(fmt.Errorf("Cannot find index %s", fullIndexNameStr))
 		}
-		fullColNameStr := fmt.Sprintf("%s.%s.%s", schema, rawIndex.TableName, rawIndex.ColumnName)
-		col, ok := columnsByTableAndName[fullColNameStr]
-		if !ok {
-			panic(fmt.Errorf("Cannot find indexed column %s for index %s", fullColNameStr, fullIndexNameStr))
+		for len(index.Parts) < int(rawIndex.SeqInIndex) {
+			index.Parts = append(index.Parts, IndexPart{})
 		}
-		for len(index.Columns) < int(rawIndex.SeqInIndex) {
-			index.Columns = append(index.Columns, new(Column))
-			index.SubParts = append(index.SubParts, 0)
-		}
-		index.Columns[rawIndex.SeqInIndex-1] = col
-		if rawIndex.SubPart.Valid {
-			index.SubParts[rawIndex.SeqInIndex-1] = uint16(rawIndex.SubPart.Int64)
+		index.Parts[rawIndex.SeqInIndex-1] = IndexPart{
+			ColumnName:   rawIndex.ColumnName.String,
+			Expression:   rawIndex.Expression.String,
+			PrefixLength: uint16(rawIndex.SubPart.Int64),
+			Descending:   (rawIndex.Collation.String == "D"),
 		}
 	}
 	for _, t := range tables {
@@ -912,20 +1091,20 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 	var rawForeignKeys []struct {
 		Name                 string `db:"constraint_name"`
 		TableName            string `db:"table_name"`
+		ColumnName           string `db:"column_name"`
 		UpdateRule           string `db:"update_rule"`
 		DeleteRule           string `db:"delete_rule"`
 		ReferencedTableName  string `db:"referenced_table_name"`
 		ReferencedSchemaName string `db:"referenced_schema"`
 		ReferencedColumnName string `db:"referenced_column_name"`
-		ColumnLookupKey      string `db:"col_lookup_key"`
 	}
 	query = `
 		SELECT   rc.constraint_name AS constraint_name, rc.table_name AS table_name,
+		         kcu.column_name AS column_name,
 		         rc.update_rule AS update_rule, rc.delete_rule AS delete_rule,
 		         rc.referenced_table_name AS referenced_table_name,
 		         IF(rc.constraint_schema=rc.unique_constraint_schema, '', rc.unique_constraint_schema) AS referenced_schema,
-		         kcu.referenced_column_name AS referenced_column_name,
-		         CONCAT(kcu.constraint_schema, '.', kcu.table_name, '.', kcu.column_name) AS col_lookup_key
+		         kcu.referenced_column_name AS referenced_column_name
 		FROM     referential_constraints rc
 		JOIN     key_column_usage kcu ON kcu.constraint_name = rc.constraint_name AND
 		                                 kcu.table_schema = ? AND
@@ -938,9 +1117,8 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 	foreignKeysByTableName := make(map[string][]*ForeignKey)
 	foreignKeysByName := make(map[string]*ForeignKey)
 	for _, rawForeignKey := range rawForeignKeys {
-		col := columnsByTableAndName[rawForeignKey.ColumnLookupKey]
 		if fk, already := foreignKeysByName[rawForeignKey.Name]; already {
-			fk.Columns = append(fk.Columns, col)
+			fk.ColumnNames = append(fk.ColumnNames, rawForeignKey.ColumnName)
 			fk.ReferencedColumnNames = append(fk.ReferencedColumnNames, rawForeignKey.ReferencedColumnName)
 		} else {
 			foreignKey := &ForeignKey{
@@ -949,7 +1127,7 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 				ReferencedTableName:   rawForeignKey.ReferencedTableName,
 				UpdateRule:            rawForeignKey.UpdateRule,
 				DeleteRule:            rawForeignKey.DeleteRule,
-				Columns:               []*Column{col},
+				ColumnNames:           []string{rawForeignKey.ColumnName},
 				ReferencedColumnNames: []string{rawForeignKey.ReferencedColumnName},
 			}
 			foreignKeysByName[rawForeignKey.Name] = foreignKey
@@ -960,6 +1138,67 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 		t.ForeignKeys = foreignKeysByTableName[t.Name]
 	}
 
+	// Obtain partitioning information, if at least one table was partitioned
+	if havePartitions {
+		var rawPartitioning []struct {
+			TableName     string         `db:"table_name"`
+			PartitionName string         `db:"partition_name"`
+			SubName       sql.NullString `db:"subpartition_name"`
+			Method        string         `db:"partition_method"`
+			SubMethod     sql.NullString `db:"subpartition_method"`
+			Expression    sql.NullString `db:"partition_expression"`
+			SubExpression sql.NullString `db:"subpartition_expression"`
+			Values        sql.NullString `db:"partition_description"`
+			Comment       string         `db:"partition_comment"`
+		}
+		query := `
+			SELECT   p.table_name AS table_name, p.partition_name AS partition_name,
+			         p.subpartition_name AS subpartition_name,
+			         p.partition_method AS partition_method,
+			         p.subpartition_method AS subpartition_method,
+			         p.partition_expression AS partition_expression,
+			         p.subpartition_expression AS subpartition_expression,
+			         p.partition_description AS partition_description,
+			         p.partition_comment AS partition_comment
+			FROM     partitions p
+			WHERE    p.table_schema = ?
+			AND      p.partition_name IS NOT NULL
+			ORDER BY p.table_name, p.partition_ordinal_position,
+			         p.subpartition_ordinal_position`
+		if err := db.Select(&rawPartitioning, query, schema); err != nil {
+			return nil, fmt.Errorf("Error querying information_schema.partitions for schema %s: %s", schema, err)
+		}
+
+		partitioningByTableName := make(map[string]*TablePartitioning)
+		for _, rawPart := range rawPartitioning {
+			p, ok := partitioningByTableName[rawPart.TableName]
+			if !ok {
+				p = &TablePartitioning{
+					Method:        rawPart.Method,
+					SubMethod:     rawPart.SubMethod.String,
+					Expression:    rawPart.Expression.String,
+					SubExpression: rawPart.SubExpression.String,
+					Partitions:    make([]*Partition, 0),
+				}
+				partitioningByTableName[rawPart.TableName] = p
+			}
+			p.Partitions = append(p.Partitions, &Partition{
+				Name:    rawPart.PartitionName,
+				SubName: rawPart.SubName.String,
+				Values:  rawPart.Values.String,
+				Comment: rawPart.Comment,
+			})
+		}
+		for _, t := range tables {
+			if p, ok := partitioningByTableName[t.Name]; ok {
+				for _, part := range p.Partitions {
+					part.Engine = t.Engine
+				}
+				t.Partitioning = p
+			}
+		}
+	}
+
 	// Obtain actual SHOW CREATE TABLE output and store in each table. Since
 	// there's no way in MySQL to bulk fetch this for multiple tables at once,
 	// use multiple goroutines to make this faster.
@@ -967,17 +1206,19 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer db.SetMaxOpenConns(0)
-	db.SetMaxOpenConns(10)
-	var g errgroup.Group
+	th := throttler.New(15, len(tables))
 	for _, t := range tables {
-		t := t
-		g.Go(func() (err error) {
+		go func(t *Table) {
+			var err error
 			if t.CreateStatement, err = showCreateTable(db, t.Name); err != nil {
-				return fmt.Errorf("Error executing SHOW CREATE TABLE for %s.%s: %s", EscapeIdentifier(schema), EscapeIdentifier(t.Name), err)
+				th.Done(fmt.Errorf("Error executing SHOW CREATE TABLE for %s.%s: %s", EscapeIdentifier(schema), EscapeIdentifier(t.Name), err))
+				return
 			}
 			if t.Engine == "InnoDB" {
 				t.CreateStatement = NormalizeCreateOptions(t.CreateStatement)
+			}
+			if t.Partitioning != nil {
+				fixPartitioningEdgeCases(t, flavor)
 			}
 			// Index order is unpredictable with new MySQL 8 data dictionary, so reorder
 			// indexes based on parsing SHOW CREATE TABLE if needed
@@ -990,8 +1231,17 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 				fixForeignKeyOrder(t)
 			}
 			// Create options order is unpredictable with the new MySQL 8 data dictionary
+			// Also need to fix generated column expression string literals
 			if flavor.HasDataDictionary() {
 				fixCreateOptionsOrder(t, flavor)
+				fixGenerationExpr(t, flavor)
+			}
+			// Percona Server column compression can only be parsed from SHOW CREATE
+			// TABLE. (Although it also has new I_S tables, their name differs pre-8.0
+			// vs post-8.0, and cols that aren't using a COMPRESSION_DICTIONARY are not
+			// even present there.)
+			if flavor.VendorMinVersion(VendorPercona, 5, 6, 33) && strings.Contains(t.CreateStatement, "COLUMN_FORMAT COMPRESSED") {
+				fixColumnCompression(t)
 			}
 			// Compare what we expect the create DDL to be, to determine if we support
 			// diffing for the table. Ignore next-auto-increment differences in this
@@ -1002,13 +1252,16 @@ func (instance *Instance) querySchemaTables(schema string) ([]*Table, error) {
 			if actual != expected {
 				t.UnsupportedDDL = true
 			}
-			return nil
-		})
+			th.Done(nil)
+		}(t)
+		if th.Throttle() > 0 {
+			return tables, th.Errs()[0]
+		}
 	}
-	return tables, g.Wait()
+	return tables, nil
 }
 
-var reIndexLine = regexp.MustCompile("^\\s+(?:UNIQUE )?KEY `((?:[^`]|``)+)` \\(`")
+var reIndexLine = regexp.MustCompile("^\\s+(?:UNIQUE |FULLTEXT |SPATIAL )?KEY `((?:[^`]|``)+)` (?:USING \\w+ )?\\([`(]")
 
 // MySQL 8.0 uses a different index order in SHOW CREATE TABLE than in
 // information_schema. This function fixes the struct to match SHOW CREATE
@@ -1024,6 +1277,9 @@ func fixIndexOrder(t *Table) {
 		}
 		t.SecondaryIndexes[cur] = byName[matches[1]]
 		cur++
+	}
+	if cur != len(t.SecondaryIndexes) {
+		panic(fmt.Errorf("Failed to parse indexes of %s for reordering: only matched %d of %d secondary indexes", t.Name, cur, len(t.SecondaryIndexes)))
 	}
 }
 
@@ -1076,6 +1332,94 @@ func fixCreateOptionsOrder(t *Table, flavor Flavor) {
 				return
 			}
 		}
+	}
+}
+
+// MySQL 8 has nonsensical behavior regarding string literals in generated col
+// expressions: the literals are expressed using a different charset in SHOW
+// CREATE TABLE vs information_schema.columns.generation_expression. This method
+// modifies each generated Column.GenerationExpr to match SHOW CREATE's version.
+func fixGenerationExpr(t *Table, flavor Flavor) {
+	for _, col := range t.Columns {
+		if col.GenerationExpr != "" {
+			// Approach: dynamically build a regexp that captures the generation expr
+			// from the correct line of the full SHOW CREATE TABLE output
+			origExpr := col.GenerationExpr
+			col.GenerationExpr = "!!!GENEXPR!!!"
+			reTemplate := regexp.QuoteMeta(col.Definition(flavor, t))
+			reTemplate = strings.Replace(reTemplate, col.GenerationExpr, "(.*)", -1)
+			re := regexp.MustCompile(reTemplate)
+			matches := re.FindStringSubmatch(t.CreateStatement)
+			if matches == nil {
+				// If we somehow failed to match correctly, fall back to using the
+				// uncorrected value from information_schema; unsupported diff is
+				// preferable to a nil pointer panic
+				col.GenerationExpr = origExpr
+			} else {
+				col.GenerationExpr = matches[1]
+			}
+		}
+	}
+}
+
+// fixPartitioningEdgeCases handles situations that are reflected in SHOW CREATE
+// TABLE, but missing (or difficult to obtain) in information_schema.
+func fixPartitioningEdgeCases(t *Table, flavor Flavor) {
+	// Handle edge cases for how partitions are expressed in HASH or KEY methods:
+	// typically this will just be a PARTITIONS N clause, but it could also be
+	// nothing at all, or an explicit list of partitions, depending on how the
+	// partitioning was originally created.
+	if strings.HasSuffix(t.Partitioning.Method, "HASH") || strings.HasSuffix(t.Partitioning.Method, "KEY") {
+		countClause := fmt.Sprintf("\nPARTITIONS %d", len(t.Partitioning.Partitions))
+		if strings.Contains(t.CreateStatement, countClause) {
+			t.Partitioning.ForcePartitionList = PartitionListCount
+		} else if strings.Contains(t.CreateStatement, "\n(PARTITION ") {
+			t.Partitioning.ForcePartitionList = PartitionListExplicit
+		} else if len(t.Partitioning.Partitions) == 1 {
+			t.Partitioning.ForcePartitionList = PartitionListNone
+		}
+	}
+
+	// KEY methods support an optional ALGORITHM clause, which is present in SHOW
+	// CREATE TABLE but not anywhere in information_schema
+	if strings.HasSuffix(t.Partitioning.Method, "KEY") && strings.Contains(t.CreateStatement, "ALGORITHM") {
+		re := regexp.MustCompile(fmt.Sprintf(`PARTITION BY %s ([^(]*)\(`, t.Partitioning.Method))
+		if matches := re.FindStringSubmatch(t.CreateStatement); matches != nil {
+			t.Partitioning.AlgoClause = matches[1]
+		}
+	}
+
+	// Process DATA DIRECTORY clauses, which are easier to parse from SHOW CREATE
+	// TABLE instead of information_schema.innodb_sys_tablespaces.
+	if (t.Partitioning.ForcePartitionList == PartitionListDefault || t.Partitioning.ForcePartitionList == PartitionListExplicit) &&
+		strings.Contains(t.CreateStatement, " DATA DIRECTORY = ") {
+		for _, p := range t.Partitioning.Partitions {
+			name := p.Name
+			if flavor.VendorMinVersion(VendorMariaDB, 10, 2) {
+				name = EscapeIdentifier(name)
+			}
+			name = regexp.QuoteMeta(name)
+			re := regexp.MustCompile(fmt.Sprintf(`PARTITION %s .*DATA DIRECTORY = '((?:\\\\|\\'|''|[^'])*)'`, name))
+			if matches := re.FindStringSubmatch(t.CreateStatement); matches != nil {
+				p.DataDir = matches[1]
+			}
+		}
+	}
+}
+
+var reColumnCompressionLine = regexp.MustCompile("^\\s+`((?:[^`]|``)+)` .* /\\*!50633 COLUMN_FORMAT ([^*]+) \\*/")
+
+// fixColumnCompression parses the table's CREATE string in order to populate
+// Column.ColumnFormat for columns that are using Percona Server's column
+// compression feature.
+func fixColumnCompression(t *Table) {
+	colsByName := t.ColumnsByName()
+	for _, line := range strings.Split(t.CreateStatement, "\n") {
+		matches := reColumnCompressionLine.FindStringSubmatch(line)
+		if matches == nil {
+			continue
+		}
+		colsByName[matches[1]].ColumnFormat = matches[2]
 	}
 }
 
@@ -1172,30 +1516,34 @@ func (instance *Instance) querySchemaRoutines(schema string) ([]*Routine, error)
 		for _, meta := range rawRoutineMeta {
 			key := ObjectKey{Type: ObjectType(strings.ToLower(meta.Type)), Name: meta.Name}
 			if routine, ok := dict[key]; ok {
-				routine.ParamString = meta.ParamList
+				routine.ParamString = strings.Replace(meta.ParamList, "\r\n", "\n", -1)
 				routine.ReturnDataType = meta.Returns
 				routine.Body = strings.Replace(meta.Body, "\r\n", "\n", -1)
 				routine.CreateStatement = routine.Definition(instance.Flavor())
 			}
 		}
 	}
-	defer db.SetMaxOpenConns(0)
-	db.SetMaxOpenConns(10)
-	var g errgroup.Group
+	th := throttler.New(20, len(routines))
 	for _, r := range routines {
-		if r.CreateStatement != "" {
-			continue // already hydrated from mysql.proc query above
+		if r.CreateStatement != "" { // already hydrated from mysql.proc query above
+			th.Done(nil)
+			th.Throttle()
+			continue
 		}
-		r := r
-		g.Go(func() (err error) {
+		go func(r *Routine) {
+			var err error
 			if r.CreateStatement, err = showCreateRoutine(db, r.Name, r.Type); err != nil {
-				return fmt.Errorf("Error executing SHOW CREATE %s for %s.%s: %s", r.Type.Caps(), EscapeIdentifier(schema), EscapeIdentifier(r.Name), err)
+				th.Done(fmt.Errorf("Error executing SHOW CREATE %s for %s.%s: %s", r.Type.Caps(), EscapeIdentifier(schema), EscapeIdentifier(r.Name), err))
+			} else {
+				r.CreateStatement = strings.Replace(r.CreateStatement, "\r\n", "\n", -1)
+				th.Done(r.parseCreateStatement(instance.Flavor(), schema))
 			}
-			r.CreateStatement = strings.Replace(r.CreateStatement, "\r\n", "\n", -1)
-			return r.parseCreateStatement(instance.Flavor(), schema)
-		})
+		}(r)
+		if th.Throttle() > 0 {
+			return routines, th.Errs()[0]
+		}
 	}
-	return routines, g.Wait()
+	return routines, nil
 }
 
 func showCreateRoutine(db *sqlx.DB, routine string, ot ObjectType) (create string, err error) {

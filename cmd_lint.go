@@ -84,13 +84,13 @@ func LintHandler(cfg *mybase.Config) error {
 
 func lintWalker(dir *fs.Dir, maxDepth int) *linter.Result {
 	if dir.ParseError != nil {
-		log.Error(fmt.Sprintf("Skipping schema in %s due to error: %s", dir.RelPath(), dir.ParseError))
+		log.Error(fmt.Sprintf("Skipping directory %s due to error: %s", dir.RelPath(), dir.ParseError))
 		return linter.BadConfigResult(dir, dir.ParseError)
 	}
 	log.Infof("Linting %s", dir)
 	result := lintDir(dir)
 	for _, err := range result.Exceptions {
-		log.Error(fmt.Sprintf("Skipping schema in %s due to error: %s", dir.RelPath(), err))
+		log.Error(fmt.Sprintf("Skipping directory %s due to error: %s", dir.RelPath(), err))
 	}
 	for _, annotation := range result.Annotations {
 		annotation.Log()
@@ -132,15 +132,17 @@ func lintDir(dir *fs.Dir) *linter.Result {
 
 	// Get workspace options for dir. This involves connecting to the first
 	// defined instance, unless configured to use local Docker.
-	var inst *tengo.Instance
-	if wsType, _ := dir.Config.GetEnum("workspace", "temp-schema", "docker"); wsType != "docker" || !dir.Config.Changed("flavor") {
-		if inst, err = dir.FirstInstance(); err != nil {
+	var wsOpts workspace.Options
+	if len(dir.LogicalSchemas) > 0 {
+		var inst *tengo.Instance
+		if wsType, _ := dir.Config.GetEnum("workspace", "temp-schema", "docker"); wsType != "docker" || !dir.Config.Changed("flavor") {
+			if inst, err = dir.FirstInstance(); err != nil {
+				return linter.BadConfigResult(dir, err)
+			}
+		}
+		if wsOpts, err = workspace.OptionsForDir(dir, inst); err != nil {
 			return linter.BadConfigResult(dir, err)
 		}
-	}
-	wsOpts, err := workspace.OptionsForDir(dir, inst)
-	if err != nil {
-		return linter.BadConfigResult(dir, err)
 	}
 
 	result := &linter.Result{}
@@ -150,7 +152,7 @@ func lintDir(dir *fs.Dir) *linter.Result {
 		wsSchema, err := workspace.ExecLogicalSchema(logicalSchema, wsOpts)
 		if err != nil {
 			result.Fatal(err)
-			return result
+			continue
 		}
 		result.AnnotateStatementErrors(wsSchema.Failures, opts)
 

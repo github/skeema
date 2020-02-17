@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -292,7 +293,6 @@ func (dir *Dir) Instances() ([]*tengo.Instance, error) {
 	for _, host := range hosts {
 		var dsn string
 		thisPortValue := portValue
-		// TODO also support cloudsql DSNs
 		if host == "localhost" && (socketWasSupplied || !portWasSupplied) {
 			dsn = fmt.Sprintf("%s@unix(%s)/?%s", userAndPass, socketValue, params)
 		} else {
@@ -380,7 +380,7 @@ func (dir *Dir) SchemaNames(instance *tengo.Instance) (names []string, err error
 		if err != nil {
 			return nil, err
 		}
-	} else if schemaValue == "*" {
+	} else if schemaValue == "*" || looksLikeRegex(schemaValue) {
 		// This automatically already filters out information_schema, performance_schema, sys, test, mysql
 		if names, err = instance.SchemaNames(); err != nil {
 			return nil, err
@@ -390,6 +390,20 @@ func (dir *Dir) SchemaNames(instance *tengo.Instance) (names []string, err error
 		// relevant here since in all other cases, we use the order specified by the
 		// user in config.)
 		sort.Strings(names)
+		// Now handle regex filtering, if requested
+		if schemaValue != "*" {
+			re, err := regexp.Compile(schemaValue[1 : len(schemaValue)-1])
+			if err != nil {
+				return nil, err
+			}
+			keepNames := []string{}
+			for _, name := range names {
+				if re.MatchString(name) {
+					keepNames = append(keepNames, name)
+				}
+			}
+			names = keepNames
+		}
 	} else {
 		names = dir.Config.GetSlice("schema", ',', true)
 	}
@@ -416,6 +430,10 @@ func (dir *Dir) SchemaNames(instance *tengo.Instance) (names []string, err error
 		}
 	}
 	return keepNames, nil
+}
+
+func looksLikeRegex(input string) bool {
+	return len(input) > 2 && input[0] == '/' && input[len(input)-1] == '/'
 }
 
 // HasSchema returns true if this dir maps to at least one schema, either by
@@ -449,6 +467,7 @@ func (dir *Dir) InstanceDefaultParams() (string, error) {
 	banned := map[string]bool{
 		// go-sql-driver/mysql special params that should not be overridden
 		"allowallfiles":     true,
+		"checkconnliveness": true,
 		"clientfoundrows":   true,
 		"columnswithalias":  true,
 		"interpolateparams": true, // always enabled explicitly later in this method
@@ -473,7 +492,7 @@ func (dir *Dir) InstanceDefaultParams() (string, error) {
 
 	// Set overridable options
 	v.Set("timeout", "5s")
-	v.Set("readTimeout", "5s")
+	v.Set("readTimeout", "20s")
 	v.Set("writeTimeout", "5s")
 	v.Set("sql_mode", "'ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'")
 	v.Set("innodb_strict_mode", "1")

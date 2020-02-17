@@ -80,7 +80,7 @@ func TestOptionsForDir(t *testing.T) {
 
 	// Confirm ConfigError implements Error interface and works as expected
 	var err error
-	err = ConfigError("testing ConfigError")
+	err = NewConfigError(dir, "testing ConfigError")
 	if err.Error() != "testing ConfigError" {
 		t.Errorf("ConfigError not behaving as expected")
 	}
@@ -127,4 +127,42 @@ func TestOptionsIgnore(t *testing.T) {
 	assertIgnore(tengo.ObjectTypeTable, "cats", false)
 	assertIgnore(tengo.ObjectTypeTable, "horses", true)
 	assertIgnore(tengo.ObjectTypeTable, "dogs", true)
+}
+
+func TestOptionsEquals(t *testing.T) {
+	dir := getDir(t, "testdata/validcfg")
+	opts, err := OptionsForDir(dir)
+	if err != nil {
+		t.Fatalf("Unexpected error from OptionsForDir: %s", err)
+	}
+	other, _ := OptionsForDir(dir)
+	if !opts.Equals(&other) {
+		t.Errorf("Two equivalent options structs are unexpectedly not equal: %+v vs %+v", opts, other)
+	}
+
+	if other.IgnoreTable = nil; opts.Equals(&other) {
+		t.Error("Equals unexpectedly still returning true even after setting IgnoreTable to nil")
+	}
+	if other.IgnoreTable = regexp.MustCompile("ignoreme"); opts.Equals(&other) {
+		t.Error("Equals unexpectedly still returning true even after setting IgnoreTable to other value")
+	}
+
+	other, _ = OptionsForDir(dir)
+	if other.RuleSeverity["charset"] = SeverityError; opts.Equals(&other) {
+		t.Error("Equals unexpectedly still returning true even after changing a severity value")
+	}
+
+	other, _ = OptionsForDir(dir)
+	if other.RuleConfig["auto-inc"] = []string{}; opts.Equals(&other) {
+		t.Error("Equals unexpectedly still returning true even after changing a rule config")
+	}
+
+	other, _ = OptionsForDir(dir)
+	other.OnlyKeys([]tengo.ObjectKey{
+		{Type: tengo.ObjectTypeTable, Name: "cats"},
+		{Type: tengo.ObjectTypeTable, Name: "dogs"},
+	})
+	if opts.Equals(&other) {
+		t.Error("Equals unexpectedly still returning true even after calling OnlyKeys")
+	}
 }

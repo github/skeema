@@ -73,20 +73,69 @@ func SplitHostOptionalPort(hostaddr string) (string, int, error) {
 	return host, port, nil
 }
 
-var reParseCreate = regexp.MustCompile(`[)] ENGINE=\w+ (AUTO_INCREMENT=(\d+) )DEFAULT CHARSET=`)
+var reParseCreateAutoInc = regexp.MustCompile(`[)] ENGINE=\w+ (AUTO_INCREMENT=(\d+) )DEFAULT CHARSET=`)
 
 // ParseCreateAutoInc parses a CREATE TABLE statement, formatted in the same
 // manner as SHOW CREATE TABLE, and removes the table-level next-auto-increment
 // clause if present. The modified CREATE TABLE will be returned, along with
 // the next auto-increment value if one was found.
 func ParseCreateAutoInc(createStmt string) (string, uint64) {
-	matches := reParseCreate.FindStringSubmatch(createStmt)
+	matches := reParseCreateAutoInc.FindStringSubmatch(createStmt)
 	if matches == nil {
 		return createStmt, 0
 	}
 	nextAutoInc, _ := strconv.ParseUint(matches[2], 10, 64)
 	newStmt := strings.Replace(createStmt, matches[1], "", 1)
 	return newStmt, nextAutoInc
+}
+
+var reParseCreatePartitioning = regexp.MustCompile(`(?is)(\s*(?:/\*!?\d*)?\s*partition\s+by .*)$`)
+
+// ParseCreatePartitioning parses a CREATE TABLE statement, formatted in the
+// same manner as SHOW CREATE TABLE, and splits out the base CREATE clauses from
+// the partioning clause.
+func ParseCreatePartitioning(createStmt string) (base, partitionClause string) {
+	matches := reParseCreatePartitioning.FindStringSubmatch(createStmt)
+	if matches == nil {
+		return createStmt, ""
+	}
+	return createStmt[0 : len(createStmt)-len(matches[1])], matches[1]
+}
+
+// reformatCreateOptions converts a value obtained from
+// information_schema.tables.create_options to the formatting used in SHOW
+// CREATE TABLE.
+func reformatCreateOptions(input string) string {
+	if input == "" {
+		return ""
+	}
+	options := strings.Split(input, " ")
+	result := make([]string, 0, len(options))
+
+	for _, kv := range options {
+		tokens := strings.SplitN(kv, "=", 2)
+		// Option name always all caps in SHOW CREATE TABLE, *except* for backtick-
+		// wrapped option names in MariaDB, which preserve the capitalization supplied
+		// by the user
+		if tokens[0][0] != '`' {
+			tokens[0] = strings.ToUpper(tokens[0])
+		}
+		if len(tokens) == 1 {
+			// Partitioned tables have "partitioned" in this field, but partitioning
+			// information is contained in a different spot in SHOW CREATE TABLE
+			if tokens[0] != "PARTITIONED" {
+				result = append(result, tokens[0])
+			}
+			continue
+		}
+
+		// Double quote wrapper changed to single quotes in SHOW CREATE TABLE
+		if tokens[1][0] == '"' && tokens[1][len(tokens[1])-1] == '"' {
+			tokens[1] = fmt.Sprintf("'%s'", tokens[1][1:len(tokens[1])-1])
+		}
+		result = append(result, fmt.Sprintf("%s=%s", tokens[0], tokens[1]))
+	}
+	return strings.Join(result, " ")
 }
 
 var normalizeCreateRegexps = []struct {

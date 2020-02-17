@@ -201,12 +201,20 @@ func getWrapper(config *mybase.Config, diff tengo.ObjectDiff, tableSize int64, m
 // getConnectParams returns the necessary connection params (session variables)
 // for the supplied diff and config.
 func getConnectParams(diff tengo.ObjectDiff, config *mybase.Config) string {
-	// If adding foreign key constraints, use foreign_key_checks=1 if requested
-	if td, ok := diff.(*tengo.TableDiff); ok && config.GetBool("foreign-key-checks") {
-		_, addFKs := td.SplitAddForeignKeys()
-		if addFKs != nil {
-			return "foreign_key_checks=1"
+	// Use unlimited query timeout for ALTER TABLE or DROP TABLE, since these
+	// operations can be slow on large tables.
+	// For ALTER TABLE, if requested, also use foreign_key_checks=1 if adding
+	// new foreign key constraints.
+	if td, ok := diff.(*tengo.TableDiff); ok && td.Type == tengo.DiffTypeAlter {
+		if config.GetBool("foreign-key-checks") {
+			_, addFKs := td.SplitAddForeignKeys()
+			if addFKs != nil {
+				return "readTimeout=0&foreign_key_checks=1"
+			}
 		}
+		return "readTimeout=0"
+	} else if ok && td.Type == tengo.DiffTypeDrop {
+		return "readTimeout=0"
 	}
 
 	// If creating a routine, use the server's global sql_mode instead of Skeema's

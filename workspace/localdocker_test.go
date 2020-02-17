@@ -17,6 +17,7 @@ func (s WorkspaceIntegrationSuite) TestLocalDockerErrors(t *testing.T) {
 		DefaultCollation:    "latin1_swedish_ci",
 		RootPassword:        "",
 		LockWaitTimeout:     100 * time.Millisecond,
+		Concurrency:         10,
 	}
 
 	// FlavorUnknown should result in error
@@ -25,7 +26,7 @@ func (s WorkspaceIntegrationSuite) TestLocalDockerErrors(t *testing.T) {
 	}
 
 	// Valid flavor but invalid schema name should error
-	opts.Flavor = s.d.Flavor()
+	opts.Flavor = s.d.Flavor().Family()
 	opts.SchemaName = "mysql"
 	if _, err := New(opts); err == nil {
 		t.Fatal("Expected error from invalid schema name, but err was nil")
@@ -36,13 +37,14 @@ func (s WorkspaceIntegrationSuite) TestLocalDocker(t *testing.T) {
 	opts := Options{
 		Type:                TypeLocalDocker,
 		CleanupAction:       CleanupActionNone,
-		Flavor:              s.d.Flavor(),
+		Flavor:              s.d.Flavor().Family(),
 		SchemaName:          "_skeema_tmp",
 		DefaultCharacterSet: "latin1",
 		DefaultCollation:    "latin1_swedish_ci",
 		DefaultConnParams:   "wait_timeout=123",
 		RootPassword:        "",
 		LockWaitTimeout:     100 * time.Millisecond,
+		Concurrency:         10,
 	}
 
 	ws, err := New(opts)
@@ -71,12 +73,13 @@ func (s WorkspaceIntegrationSuite) TestLocalDockerShutdown(t *testing.T) {
 	opts := Options{
 		Type:                TypeLocalDocker,
 		CleanupAction:       CleanupActionNone,
-		Flavor:              s.d.Flavor(),
+		Flavor:              s.d.Flavor().Family(),
 		SchemaName:          "_skeema_tmp",
 		DefaultCharacterSet: "latin1",
 		DefaultCollation:    "latin1_swedish_ci",
 		RootPassword:        "",
 		LockWaitTimeout:     100 * time.Millisecond,
+		Concurrency:         10,
 	}
 
 	// Test with CleanupActionNone
@@ -123,7 +126,7 @@ func (s WorkspaceIntegrationSuite) TestLocalDockerShutdown(t *testing.T) {
 	opts.CleanupAction = CleanupActionDestroy
 	ld, _ = NewLocalDocker(opts)
 	// Cleanup should fail if a table has rows
-	if _, err := ld.d.SourceSQL("../testdata/tempschema1.sql"); err != nil {
+	if _, err := ld.d.SourceSQL("testdata/tempschema1.sql"); err != nil {
 		t.Fatalf("Unexpected SourceSQL error: %s", err)
 	}
 	if err := ld.Cleanup(); err == nil {
@@ -146,13 +149,14 @@ func (s WorkspaceIntegrationSuite) TestLocalDockerConnParams(t *testing.T) {
 	opts := Options{
 		Type:                TypeLocalDocker,
 		CleanupAction:       CleanupActionNone,
-		Flavor:              s.d.Flavor(),
+		Flavor:              s.d.Flavor().Family(),
 		SchemaName:          "_skeema_tmp",
 		DefaultCharacterSet: "latin1",
 		DefaultCollation:    "latin1_swedish_ci",
 		DefaultConnParams:   "wait_timeout=123",
 		RootPassword:        "",
 		LockWaitTimeout:     100 * time.Millisecond,
+		Concurrency:         10,
 	}
 
 	ws, err := New(opts)

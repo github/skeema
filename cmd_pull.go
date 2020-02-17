@@ -33,6 +33,7 @@ top of the file. If no environment name is supplied, the default is
 	cmd.AddOption(mybase.BoolOption("format", 0, true, "Reformat SQL statements to match canonical SHOW CREATE"))
 	cmd.AddOption(mybase.BoolOption("normalize", 0, true, "(deprecated alias for format)").Hidden())
 	cmd.AddOption(mybase.BoolOption("new-schemas", 0, true, "Detect any new schemas and populate new dirs for them"))
+	cmd.AddOption(mybase.StringOption("partitioning", 0, "keep", "(slight pull impact of having partitioning=remove in .skeema file for diff/push)").Hidden())
 	cmd.AddArg("environment", "production", false)
 	CommandSuite.AddSubCommand(cmd)
 }
@@ -141,7 +142,7 @@ func pullSchemaDir(dir *fs.Dir, instance *tengo.Instance) (schemaNames []string,
 	return
 }
 
-// pullSchemaDir performs appropriate pull logic on a dir that maps to one or
+// pullLogicalSchema performs appropriate pull logic on a dir that maps to one or
 // more schemas. A slice of handled schema names is returned, along with any
 // error encountered.
 func pullLogicalSchema(dir *fs.Dir, instance *tengo.Instance, logicalSchema *fs.LogicalSchema) (schemaNames []string, err error) {
@@ -186,6 +187,9 @@ func pullLogicalSchema(dir *fs.Dir, instance *tengo.Instance, logicalSchema *fs.
 	if dumpOpts.IgnoreTable, err = dir.Config.GetRegexp("ignore-table"); err != nil {
 		return nil, NewExitValue(CodeBadConfig, err.Error())
 	}
+	if partitioning, _ := dir.Config.GetEnum("partitioning", "keep", "remove", "modify"); partitioning == "remove" {
+		dumpOpts.RetainPartitioning = true
+	}
 
 	// When --skip-format is in use, we only want to update objects that have
 	// actual functional modifications, NOT just cosmetic/formatting differences.
@@ -228,6 +232,12 @@ func statementModifiersForPull(config *mybase.Config, instance *tengo.Instance, 
 		mods.Flavor = confFlavor
 	} else {
 		mods.Flavor = instFlavor
+	}
+	// If pulling from an environment that uses partitioning=remove, apply a
+	// statement modifier to make tengo.RemovePartitioning.Clause return an empty
+	// string. Otherwise, every partitioned-in-fs will show up as having a diff!
+	if partitioning, _ := config.GetEnum("partitioning", "keep", "remove", "modify"); partitioning == "remove" {
+		mods.Partitioning = tengo.PartitioningKeep
 	}
 	return mods
 }
@@ -276,14 +286,14 @@ func objectsInDiff(logicalSchema *fs.LogicalSchema, instSchema *tengo.Schema, op
 // undetectable flavor.
 func updateFlavor(dir *fs.Dir, instance *tengo.Instance) {
 	instFlavor := instance.Flavor()
-	if !instFlavor.Known() || instFlavor.String() == dir.Config.Get("flavor") {
+	if !instFlavor.Known() || instFlavor.Family().String() == dir.Config.Get("flavor") {
 		return
 	}
-	dir.OptionFile.SetOptionValue(dir.Config.Get("environment"), "flavor", instFlavor.String())
+	dir.OptionFile.SetOptionValue(dir.Config.Get("environment"), "flavor", instFlavor.Family().String())
 	if err := dir.OptionFile.Write(true); err != nil {
 		log.Warnf("Unable to update flavor in %s: %s", dir.OptionFile.Path(), err)
 	} else {
-		log.Infof("Wrote %s -- updated flavor to %s", dir.OptionFile.Path(), instFlavor.String())
+		log.Infof("Wrote %s -- updated flavor to %s", dir.OptionFile.Path(), instFlavor.Family().String())
 	}
 }
 

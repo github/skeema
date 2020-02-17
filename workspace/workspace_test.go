@@ -148,6 +148,36 @@ func (s WorkspaceIntegrationSuite) TestExecLogicalSchemaErrors(t *testing.T) {
 	}
 }
 
+// TestExecLogicalSchemaFK confirms that ExecLogicalSchema does not choke on
+// concurrent table creation involving cross-referencing foreign keys. This
+// situation, if not specially handled, is known to cause random deadlock
+// errors with MySQL 8.0's new data dictionary.
+func (s WorkspaceIntegrationSuite) TestExecLogicalSchemaFK(t *testing.T) {
+	if !s.d.Flavor().HasDataDictionary() {
+		t.Skip("Test only relevant for flavors that have the new data dictionary")
+	}
+
+	dir := s.getParsedDir(t, "testdata/manyfk", "")
+	opts, err := OptionsForDir(dir, s.d.Instance)
+	if err != nil {
+		t.Fatalf("Unexpected error from OptionsForDir: %s", err)
+	}
+	opts.LockWaitTimeout = 100 * time.Millisecond
+
+	// Test multiple times, since the problem isn't deterministic
+	for n := 0; n < 3; n++ {
+		wsSchema, err := ExecLogicalSchema(dir.LogicalSchemas[0], opts)
+		if err != nil {
+			t.Fatalf("Unexpected error from ExecLogicalSchema: %s", err)
+		}
+		if len(wsSchema.Failures) > 0 {
+			t.Errorf("Expected no StatementErrors, instead found %d; first err %v from %s", len(wsSchema.Failures), wsSchema.Failures[0].Err, wsSchema.Failures[0].Statement.Location())
+		} else if len(wsSchema.Tables) < 6 {
+			t.Errorf("Expected at least 6 tables, but instead found %d", len(wsSchema.Tables))
+		}
+	}
+}
+
 func (s WorkspaceIntegrationSuite) TestOptionsForDir(t *testing.T) {
 	getOpts := func(cliFlags string) Options {
 		t.Helper()
@@ -170,6 +200,10 @@ func (s WorkspaceIntegrationSuite) TestOptionsForDir(t *testing.T) {
 	assertOptsError("--workspace=invalid")
 	assertOptsError("--workspace=docker --docker-cleanup=invalid")
 	assertOptsError("--workspace=docker --connect-options='autocommit=0'")
+	assertOptsError("--workspace=temp-schema --temp-schema-threads=0")
+	assertOptsError("--workspace=temp-schema --temp-schema-threads=-20")
+	assertOptsError("--workspace=temp-schema --temp-schema-threads=banana")
+	assertOptsError("--workspace=temp-schema --temp-schema-binlog=potato")
 
 	// Test default configuration, which should use temp-schema with drop cleanup
 	if opts := getOpts(""); opts.Type != TypeTempSchema || opts.CleanupAction != CleanupActionDrop {
@@ -185,7 +219,7 @@ func (s WorkspaceIntegrationSuite) TestOptionsForDir(t *testing.T) {
 	// Test docker with defaults, which should have no cleanup action, and match
 	// flavor of suite's DockerizedInstance
 	opts = getOpts("--workspace=docker")
-	if opts.Type != TypeLocalDocker || opts.CleanupAction != CleanupActionNone || opts.Flavor != s.d.Flavor() {
+	if opts.Type != TypeLocalDocker || opts.CleanupAction != CleanupActionNone || opts.Flavor.String() != s.d.Flavor().Family().String() {
 		t.Errorf("Unexpected return from OptionsForDir: %+v", opts)
 	}
 
@@ -228,7 +262,12 @@ func (s WorkspaceIntegrationSuite) TestPrefab(t *testing.T) {
 		t.Errorf("Expected IntrospectSchema returned unexpected error %s", err)
 	}
 
-	wsSchema, err := ExecLogicalSchema(dir.LogicalSchemas[0], Options{Type: TypePrefab, PrefabWorkspace: ws})
+	opts = Options{
+		Type:            TypePrefab,
+		PrefabWorkspace: ws,
+		Concurrency:     10,
+	}
+	wsSchema, err := ExecLogicalSchema(dir.LogicalSchemas[0], opts)
 	if err != nil {
 		t.Fatalf("Unexpected error from ExecLogicalSchema: %s", err)
 	}
@@ -259,7 +298,7 @@ func (s *WorkspaceIntegrationSuite) Teardown(backend string) error {
 	return s.d.Stop()
 }
 
-func (s *WorkspaceIntegrationSuite) BeforeTest(method string, backend string) error {
+func (s *WorkspaceIntegrationSuite) BeforeTest(backend string) error {
 	return s.d.NukeData()
 }
 

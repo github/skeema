@@ -179,7 +179,7 @@ func (s SkeemaIntegrationSuite) TestAddEnvHandler(t *testing.T) {
 	origFile.SetOptionValue("cloud", "port", fmt.Sprintf("%d", s.d.Instance.Port))
 	origFile.SetOptionValue("cloud", "ignore-schema", "^test")
 	origFile.SetOptionValue("cloud", "ignore-table", "^_")
-	origFile.SetOptionValue("cloud", "flavor", s.d.Flavor().String())
+	origFile.SetOptionValue("cloud", "flavor", s.d.Flavor().Family().String())
 	if !origFile.SameContents(file) {
 		t.Fatalf("File contents of %s do not match expectation", file.Path())
 	}
@@ -932,6 +932,10 @@ func (s SkeemaIntegrationSuite) TestNonInnoClauses(t *testing.T) {
 		"  KEY `idx1` (`name`) COMMENT 'lol',\n" +
 		"  KEY `idx2` (`num`)\n" +
 		") ENGINE=InnoDB DEFAULT CHARSET=latin1 KEY_BLOCK_SIZE=8;\n"
+	if s.d.Flavor().OmitIntDisplayWidth() {
+		withClauses = strings.Replace(withClauses, "int(10)", "int", -1)
+		withoutClauses = strings.Replace(withoutClauses, "int(10)", "int", -1)
+	}
 	assertFileNormalized := func() {
 		t.Helper()
 		if contents := fs.ReadTestFile(t, "mydb/product/problems.sql"); contents != withoutClauses {
@@ -1033,15 +1037,15 @@ func (s SkeemaIntegrationSuite) TestShardedSchemas(t *testing.T) {
 
 	// pull should still reflect changes properly, if made to the first sharded
 	// product schema or to the unsharded analytics schema
-	s.dbExec(t, "product", "ALTER TABLE comments ADD COLUMN `approved` tinyint(1) unsigned NOT NULL")
-	s.dbExec(t, "analytics", "ALTER TABLE activity ADD COLUMN `rolled_up` tinyint(1) unsigned NOT NULL")
+	s.dbExec(t, "product", "ALTER TABLE comments ADD COLUMN `approved` tinyint(1) NOT NULL")
+	s.dbExec(t, "analytics", "ALTER TABLE activity ADD COLUMN `rolled_up` tinyint(1) NOT NULL")
 	s.handleCommand(t, CodeSuccess, ".", "skeema pull --ignore-schema=4$")
 	sfContents := fs.ReadTestFile(t, "mydb/product/comments.sql")
-	if !strings.Contains(sfContents, "`approved` tinyint(1) unsigned") {
+	if !strings.Contains(sfContents, "`approved` tinyint(1)") {
 		t.Error("Pull did not update mydb/product/comments.sql as expected")
 	}
 	sfContents = fs.ReadTestFile(t, "mydb/analytics/activity.sql")
-	if !strings.Contains(sfContents, "`rolled_up` tinyint(1) unsigned") {
+	if !strings.Contains(sfContents, "`rolled_up` tinyint(1)") {
 		t.Error("Pull did not update mydb/analytics/activity.sql as expected")
 	}
 
@@ -1096,9 +1100,25 @@ func (s SkeemaIntegrationSuite) TestShardedSchemas(t *testing.T) {
 	// Test combination of ignore-schema and schema=*
 	fs.WriteTestFile(t, "mydb/product/foo2.sql", "CREATE TABLE `foo2` (id int);\n")
 	s.handleCommand(t, CodeSuccess, ".", "skeema push --ignore-schema=2$")
+	s.assertTableExists(t, "analytics", "foo2", "")
 	s.assertTableExists(t, "product1", "foo2", "")
 	s.assertTableMissing(t, "product2", "foo2", "")
 	s.assertTableExists(t, "product3", "foo2", "")
+
+	// Test use of regex for schema name, again combined with ignore-schema
+	contents = strings.Replace(contents, "schema=*", "schema=/^product/", 1)
+	fs.WriteTestFile(t, "mydb/product/.skeema", contents)
+	fs.WriteTestFile(t, "mydb/product/foo3.sql", "CREATE TABLE `foo3` (id int);\n")
+	s.handleCommand(t, CodeSuccess, ".", "skeema push --ignore-schema=3$")
+	s.assertTableMissing(t, "analytics", "foo3", "")
+	s.assertTableExists(t, "product1", "foo3", "")
+	s.assertTableExists(t, "product2", "foo3", "")
+	s.assertTableMissing(t, "product3", "foo3", "")
+
+	// Test invalid regex
+	contents = strings.Replace(contents, "schema=/^product/", "schema=/+/", 1)
+	fs.WriteTestFile(t, "mydb/product/.skeema", contents)
+	s.handleCommand(t, CodeFatalError, ".", "skeema push")
 }
 
 func (s SkeemaIntegrationSuite) TestFlavorConfig(t *testing.T) {
@@ -1116,7 +1136,14 @@ func (s SkeemaIntegrationSuite) TestFlavorConfig(t *testing.T) {
 	}
 
 	realFlavor := inst.Flavor()
-	badFlavor := tengo.Flavor{Vendor: tengo.VendorUnknown, Major: 10, Minor: 3}
+	badFlavor := tengo.Flavor{Vendor: tengo.VendorUnknown, Major: realFlavor.Major, Minor: realFlavor.Minor}
+	if realFlavor.Vendor == tengo.VendorMariaDB {
+		// Hack to avoid Unknown:10.1 or higher being interpretted as having support
+		// for things in MySQL 5.7+ that aren't in MariaDB, since VendorUnknown is
+		// treated as MySQLish
+		badFlavor.Major, badFlavor.Minor = 5, 6
+	}
+	defer inst.ForceFlavor(realFlavor) // clean up in case test aborts
 
 	// diff should return no differences
 	inst.ForceFlavor(badFlavor)
@@ -1158,10 +1185,10 @@ func (s SkeemaIntegrationSuite) TestFlavorConfig(t *testing.T) {
 		newFlavor = tengo.FlavorMySQL57
 	}
 	contents = fs.ReadTestFile(t, "mydb/.skeema")
-	if !strings.Contains(contents, realFlavor.String()) {
+	if !strings.Contains(contents, realFlavor.Family().String()) {
 		t.Fatal("Could not find flavor line in mydb/.skeema")
 	}
-	contents = strings.Replace(contents, realFlavor.String(), newFlavor.String(), 1)
+	contents = strings.Replace(contents, realFlavor.Family().String(), newFlavor.Family().String(), 1)
 	fs.WriteTestFile(t, "mydb/.skeema", contents)
 	s.handleCommand(t, CodeSuccess, "mydb", "skeema diff --debug")
 
@@ -1171,7 +1198,8 @@ func (s SkeemaIntegrationSuite) TestFlavorConfig(t *testing.T) {
 }
 
 func (s SkeemaIntegrationSuite) TestRoutines(t *testing.T) {
-	origCreate := `CREATE definer=root@localhost FUNCTION routine1(a int, b int)
+	origCreate := `CREATE definer=root@localhost FUNCTION routine1(a int,
+  b int)
 RETURNS int
 DETERMINISTIC
 BEGIN
@@ -1190,10 +1218,12 @@ END`
 	cfg = s.handleCommand(t, CodeSuccess, ".", "skeema lint")
 	s.verifyFiles(t, cfg, "../golden/routines")
 
-	// Change routine1.sql to use Windows-style CRLF line-end in one spot. No
+	// Change routine1.sql to use Windows-style CRLF line-end in two spots. No
 	// diff should be present. Pull should restore UNIX-style LFs.
 	routine1 := fs.ReadTestFile(t, "mydb/product/routine1.sql")
-	fs.WriteTestFile(t, "mydb/product/routine1.sql", strings.Replace(routine1, "BEGIN\n", "BEGIN\r\n", 1))
+	routine1 = strings.Replace(routine1, "a int,\n", "a int,\r\n", 1)
+	routine1 = strings.Replace(routine1, "BEGIN\n", "BEGIN\r\n", 1)
+	fs.WriteTestFile(t, "mydb/product/routine1.sql", routine1)
 	s.handleCommand(t, CodeSuccess, ".", "skeema diff")
 	cfg = s.handleCommand(t, CodeSuccess, ".", "skeema pull")
 	s.verifyFiles(t, cfg, "../golden/routines")
@@ -1302,5 +1332,222 @@ END`
 		if !exists || err != nil {
 			t.Errorf("Expected %s to exist, instead found %t, err=%v", phrase, exists, err)
 		}
+	}
+}
+
+func (s SkeemaIntegrationSuite) TestTempSchemaBinlog(t *testing.T) {
+	if !s.d.Flavor().MySQLishMinVersion(8, 0) {
+		t.Skip("Test only relevant for flavors that default to having binlog enabled")
+	}
+
+	getLogPos := func() string {
+		t.Helper()
+		db, err := s.d.Connect("", "")
+		if err != nil {
+			t.Fatalf("Unable to establish connection: %v", err)
+		}
+		var masterStatus []struct {
+			File     string `db:"File"`
+			Position string `db:"Position"`
+		}
+		if err := db.Select(&masterStatus, "SHOW MASTER STATUS"); err != nil {
+			t.Fatalf("Error running SHOW MASTER STATUS: %v", err)
+		}
+		if len(masterStatus) != 1 {
+			t.Fatalf("Wrong row count from SHOW MASTER STATUS: expected 1, found %d", len(masterStatus))
+		}
+		return fmt.Sprintf("%s %s", masterStatus[0].File, masterStatus[0].Position)
+	}
+	assertLogged := func(oldPos string) string {
+		t.Helper()
+		newPos := getLogPos()
+		if oldPos == newPos {
+			t.Errorf("Expected binary log to progress, but it did not; position remains %s", oldPos)
+		}
+		return newPos
+	}
+	assertNotLogged := func(oldPos string) string {
+		t.Helper()
+		newPos := getLogPos()
+		if oldPos != newPos {
+			t.Errorf("Expected binary logging to be skipped, but position moved from %s to %s", oldPos, newPos)
+		}
+		return newPos
+	}
+
+	pos := getLogPos()
+	s.handleCommand(t, CodeSuccess, ".", "skeema init --dir mydb -h %s -P %d", s.d.Instance.Host, s.d.Instance.Port)
+	pos = assertNotLogged(pos)
+	s.dbExec(t, "analytics", "ALTER TABLE pageviews DROP COLUMN domain")
+	createRoutine := `CREATE definer=root@localhost FUNCTION routine1(a int,
+  b int)
+RETURNS int
+DETERMINISTIC
+BEGIN
+	return a * b;
+END`
+	fs.WriteTestFile(t, "mydb/product/routine1.sql", createRoutine)
+	pos = getLogPos()
+
+	// Default behavior is temp-schema-binlog=auto, which should skip binlogging
+	// since we connect to the Dockerized test db using a privileged account
+	s.handleCommand(t, CodeSuccess, ".", "skeema lint --skip-format")
+	pos = assertNotLogged(pos)
+	s.handleCommand(t, CodeDifferencesFound, ".", "skeema diff")
+	pos = assertNotLogged(pos)
+	s.handleCommand(t, CodeDifferencesFound, ".", "skeema diff --temp-schema-binlog=off")
+	pos = assertNotLogged(pos)
+	s.handleCommand(t, CodeDifferencesFound, ".", "skeema diff --temp-schema-binlog=off --reuse-temp-schema")
+	pos = assertNotLogged(pos)
+	s.handleCommand(t, CodeDifferencesFound, ".", "skeema diff --temp-schema-binlog=OFF")
+	pos = assertNotLogged(pos)
+	s.handleCommand(t, CodeDifferencesFound, ".", "skeema diff --temp-schema-binlog=ON")
+	pos = assertLogged(pos)
+
+	// Push-related writes should still advance the binlog position
+	s.handleCommand(t, CodeSuccess, ".", "skeema push --temp-schema-binlog=off")
+	pos = assertLogged(pos)
+}
+
+func (s SkeemaIntegrationSuite) TestPartitioning(t *testing.T) {
+	s.handleCommand(t, CodeSuccess, ".", "skeema init --dir mydb -h %s -P %d", s.d.Instance.Host, s.d.Instance.Port)
+
+	contentsNoPart := fs.ReadTestFile(t, "mydb/analytics/activity.sql")
+	contents2Part := strings.Replace(contentsNoPart, ";\n",
+		"\nPARTITION BY RANGE (ts)  (PARTITION p0 VALUES LESS THAN (1571678000),\n PARTITION pN VALUES LESS THAN MAXVALUE);\n",
+		1)
+	contents3Part := strings.Replace(contentsNoPart, ";\n",
+		"\nPARTITION BY RANGE (ts)  (PARTITION p0 VALUES LESS THAN (1571678000),\n PARTITION p1 VALUES LESS THAN (1571679000),\n PARTITION pN VALUES LESS THAN MAXVALUE);\n",
+		1)
+	contents3PartPlusNewCol := strings.Replace(contents3Part, "  `target_id`", "  `somenewcol` int,\n  `target_id`", 1)
+	contentsHashPart := strings.Replace(contentsNoPart, ";\n",
+		"\nPARTITION BY HASH  (action_id) PARTITIONS 4;\n",
+		1)
+
+	// Rewrite activity.sql to be partitioned by range with 2 partitions, and then
+	// test diff behavior with each value of partitioning option
+	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents2Part)
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema diff --partitioning=remove")
+	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=keep")
+	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff") // default is keep
+	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=modify")
+	s.handleCommand(t, CodeBadConfig, "mydb/analytics", "skeema diff --partitioning=invalid")
+
+	// At this point we haven't pushed yet, but pull --partitioning=remove should
+	// leave the file unchanged, regardless of --format vs --skip-format. Here we're
+	// simulating the situation of fs having partitioning but pulling from a dev
+	// environment which does not.
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --partitioning=remove")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents != contents2Part {
+		t.Errorf("File contents modified unexpectedly by pull:\n%s", newContents)
+		fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents2Part) // so that subsequent steps proceed normally
+	}
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --partitioning=remove --skip-format")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents != contents2Part {
+		t.Errorf("File contents modified unexpectedly by pull:\n%s", newContents)
+		fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents2Part) // so that subsequent steps proceed normally
+	}
+
+	// Push to execute the ALTER to partition by range with 2 partitions.
+	// Confirm no differences with keep, but some differences with remove.
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema push") // default is keep
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema diff")
+	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=remove")
+
+	// pull --skip-format should keep the file's format unchanged; pull --format
+	// should format it
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents != contents2Part {
+		t.Errorf("File contents modified unexpectedly by pull:\n%s", newContents)
+	}
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(newContents, ")\n(PARTITION ") {
+		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
+	}
+
+	// Rewrite activity.sql to now have 3 partitions, still by range. This should
+	// not show differences for keep or modify.
+	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents3Part)
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema diff --partitioning=keep")
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema diff --partitioning=modify")
+	// Note: didn't push the above change
+
+	// pull --skip-format shouldn't touch the file, despite the partition list
+	// difference. But normal pull should rewrite it to have 2 partitions.
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents != contents3Part {
+		t.Errorf("File contents modified unexpectedly by pull:\n%s", newContents)
+		fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents3Part) // so that subsequent steps proceed normally
+	}
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents == contents3Part {
+		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
+	}
+
+	// Rewrite activity.sql to be unpartitioned. This should not show differences
+	// for keep, but should for remove or modify.
+	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contentsNoPart)
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema diff --partitioning=keep")
+	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=remove")
+	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=modify")
+	// Note: didn't push the above change
+
+	// pull should rewrite activity.sql to have 2 partitions, even with --skip-format --partitioning=remove
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(newContents, "PARTITION BY RANGE") {
+		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
+	}
+	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contentsNoPart)
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format --partitioning=remove")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(newContents, "PARTITION BY RANGE") {
+		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
+	}
+
+	// Rewrite activity.sql to have 3 partitions, still by range, as well as a new
+	// column. Pushing this with remove should add the new column but remove the
+	// partitioning.
+	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents3PartPlusNewCol)
+	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=remove")
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema push --partitioning=remove")
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format")
+	newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql")
+	if strings.Contains(newContents, "PARTITION BY") || !strings.Contains(newContents, "somenewcol") {
+		t.Errorf("Previous push did not have intended effect; current table structure: %s", newContents)
+	}
+
+	// Remove the new col and restore partitioning
+	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents3Part)
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema push --allow-unsafe --partitioning=keep")
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema diff --partitioning=keep")
+
+	// Rewrite activity.sql to be partitioned by hash. This should be ignored with
+	// keep, repartition with modify, or departition with remove.
+	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contentsHashPart)
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema diff --partitioning=keep")
+	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=modify")
+	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=remove")
+	// Note: didn't push the above change yet
+
+	// pull should restore range partitioning, even with --skip-format
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(newContents, "RANGE (") {
+		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
+	}
+
+	// Rewrite activity.sql to be partitioned by hash, and then push with remove.
+	// Files should be back to initial state.
+	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contentsHashPart)
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema push --partitioning=remove")
+	cfg := s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
+	s.verifyFiles(t, cfg, "../golden/init")
+
+	// Repartition with 2 partitions and push. Confirm that dropping the table
+	// works correctly regardless of partitioning option.
+	for _, value := range []string{"keep", "modify", "remove"} {
+		fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents2Part)
+		s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema push") // default is keep
+		fs.RemoveTestFile(t, "mydb/analytics/activity.sql")
+		s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --allow-unsafe --partitioning=%s", value)
+		s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema push --allow-unsafe --partitioning=%s", value)
 	}
 }

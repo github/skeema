@@ -11,6 +11,7 @@ This document is a reference, describing all options supported by Skeema. To lea
 * [allow-unsafe](#allow-unsafe)
 * [alter-algorithm](#alter-algorithm)
 * [alter-lock](#alter-lock)
+* [alter-validate-virtual](#alter-validate-virtual)
 * [alter-wrapper](#alter-wrapper)
 * [alter-wrapper-min-size](#alter-wrapper-min-size)
 * [brief](#brief)
@@ -43,11 +44,13 @@ This document is a reference, describing all options supported by Skeema. To lea
 * [lint-dupe-index](#lint-dupe-index)
 * [lint-engine](#lint-engine)
 * [lint-has-fk](#lint-has-fk)
+* [lint-has-float](#lint-has-float)
 * [lint-has-routine](#lint-has-routine)
 * [lint-has-time](#lint-has-time)
 * [lint-pk](#lint-pk)
 * [my-cnf](#my-cnf)
 * [new-schemas](#new-schemas)
+* [partitioning](#partitioning)
 * [password](#password)
 * [port](#port)
 * [reuse-temp-schema](#reuse-temp-schema)
@@ -55,6 +58,8 @@ This document is a reference, describing all options supported by Skeema. To lea
 * [schema](#schema)
 * [socket](#socket)
 * [temp-schema](#temp-schema)
+* [temp-schema-binlog](#temp-schema-binlog)
+* [temp-schema-threads](#temp-schema-threads)
 * [user](#user)
 * [verify](#verify)
 * [warnings](#warnings)
@@ -134,11 +139,11 @@ If set to the default of false, `skeema push` refuses to run any DDL on a databa
 The following operations are considered unsafe:
 
 * Dropping a table
-* Altering a table to drop a column
+* Altering a table to drop a normal column or stored (non-virtual) generated column
 * Altering a table to modify an existing column in a way that potentially causes data loss, length truncation, or reduction in precision
 * Altering a table to modify the character set of an existing column
 * Altering a table to change its storage engine
-* Dropping a stored procedure or function (even if just to [re-create it with a modified definition](requirements.md#edge-cases-for-routines))
+* Dropping a stored procedure or function (even if just to [re-create it with a modified definition](requirements.md#routines))
 
 If [allow-unsafe](#allow-unsafe) is set to true, these operations are fully permitted, for all tables. It is not recommended to enable this setting in an option file, especially in the production environment. It is safer to require users to supply it manually on the command-line on an as-needed basis, to serve as a confirmation step for unsafe operations.
 
@@ -177,6 +182,20 @@ The explicit value "default" is supported, and will add a "LOCK=DEFAULT" clause 
 MySQL 5.5 does not support the LOCK clause of ALTER TABLE, so use of this option will cause an error in that version.
 
 If [alter-wrapper](#alter-wrapper) is set to use an external online schema change tool such as pt-online-schema-change, [alter-lock](#alter-lock) should not be used unless [alter-wrapper-min-size](#alter-wrapper-min-size) is also in-use. This is to prevent sending ALTER statements containing LOCK clauses to the external OSC tool.
+
+### alter-validate-virtual
+
+Commands | diff, push
+--- | :---
+**Default** | false
+**Type** | bool
+**Restrictions** | none
+
+Adds a WITH VALIDATION clause to ALTER TABLEs affecting virtual generated columns, meaning that the database server will confirm that the calculated values fit into the designated data type of the new or modified virtual column(s), for all existing rows of the table. Note however that this can cause significantly slower ALTER TABLE execution. Refer to the MySQL manual for more information on the effect of this clause.
+
+Skeema will only ever apply a WITH VALIDATION clause to DDL adding or modifying a virtual generated column. This option has no effect in all other situations, meaning it is safe to enable permanently in a .skeema file if desired.
+
+This option has no effect in versions of MySQL and Percona Server prior to 5.7, when generated column support was added. This option may result in a syntax error when used in any version of MariaDB; even though MariaDB 10.2+ supports MySQL's syntax for generated columns, MariaDB does not support the WITH VALIDATION clause.
 
 ### alter-wrapper
 
@@ -275,7 +294,7 @@ Commands | diff, push
 **Type** | int
 **Restrictions** | Must be a positive integer
 
-By default, `skeema diff` and `skeema push` only operate on one instance at a time. To operate on multiple instances simultaneously, set [concurrent-instances](#concurrent-instances) to the number of database instances to run on concurrently. This is useful in an environment with multiple shards or pools.
+By default, `skeema diff` and `skeema push` only operate on one database server instance (mysqld process) at a time. To operate on multiple instances simultaneously, set [concurrent-instances](#concurrent-instances) to the number of database instances to run on concurrently. This is useful in an environment with multiple shards or pools.
 
 On each individual database instance, only one DDL operation will be run at a time by `skeema push`, regardless of [concurrent-instances](#concurrent-instances). Concurrency within an instance may be configurable in a future version of Skeema.
 
@@ -312,11 +331,13 @@ In addition to setting MySQL session variables, you may also set any of these sp
 * `charset=string` -- Character set used for client-server interaction
 * `collation=string` -- Collation used for client-server interaction
 * `maxAllowedPacket=int` -- Max allowed packet size, in bytes
-* `readTimeout=duration` -- Read timeout; the value must be a float with a unit suffix ("ms" or "s"); default 5s
+* `readTimeout=duration` -- Query timeout; the value must be a float with a unit suffix ("ms" or "s"); default 20s
 * `timeout=duration` -- Connection timeout; the value must be a float with a unit suffix ("ms" or "s"); default 5s
-* `writeTimeout=duration` -- Write timeout; the value must be a float with a unit suffix ("ms" or "s"); default 5s
+* `writeTimeout=duration` -- Socket write timeout; the value must be a float with a unit suffix ("ms" or "s"); default 5s
 
 All six of these special variables are case-sensitive. Unlike session variables, their values should never be wrapped in quotes. These special non-MySQL variables are automatically stripped from `{CONNOPTS}`, so they won't be passed through to tools that don't understand them.
+
+The value of `readTimeout` applies to all queries made directly by Skeema, except for `ALTER TABLE` and `DROP TABLE` statements, which are exempted from timeouts entirely.
 
 ### ddl-wrapper
 
@@ -414,7 +435,7 @@ For `skeema add-environment`, specifies which directory's .skeema file to add th
 
 ### docker-cleanup
 
-Commands | diff, push, pull, lint
+Commands | diff, push, pull, lint, format
 --- | :---
 **Default** | "none"
 **Type** | enum
@@ -491,7 +512,7 @@ Commands | *all*, as well as [CI](https://www.skeema.io/ci)
 **Type** | string
 **Restrictions** | Should only appear in a .skeema option file that also contains [host](#host)
 
-This option indicates the database server vendor and version corresponding to the first [host](#host) defined in this directory. The value is formatted as "vendor:major.minor", for example "mysql:5.6", "percona:5.7", or "mariadb:10.1".
+This option indicates the database server vendor and version corresponding to the first [host](#host) defined in this directory. The value is typically formatted as "vendor:major.minor", for example "mysql:5.6", "percona:5.7", or "mariadb:10.1". A patch number may optionally be included as well, for example "mysql:8.0.19".
 
 This option is automatically populated in host-level .skeema files by `skeema init`, `skeema pull`, and `skeema add-environment` beginning in Skeema v1.0.3.
 
@@ -589,6 +610,10 @@ The command's STDOUT will be split on a consistent delimiter (newline, tab, comm
 If ports are omitted, the [port](#port) option is used instead, which defaults to MySQL's standard port 3306.
 
 The external command should only return addresses of master instances, never replicas.
+
+The [host-wrapper](#host-wrapper) option is designed to be specified generically at a high level directory, such as a .skeema file at the repository root, or perhaps a [global option file](config.md#priority-of-options-set-in-multiple-places). This way, you may specify a single generic service discovery command-line usable across your infrastructure, rather than redundantly configuring a command-line for each database cluster.
+
+Setting or overriding [host-wrapper](#host-wrapper) in a subdirectory does not inherently cause the wrapper to be invoked upon processing that subdirectory; host-level subdirectories **must also still specify some value for the [host](#host) option** in order to be processed. If your [host-wrapper](#host-wrapper) command-line does not make use of the `{HOST}` variable, then just use a static value such as `host=1` in directories where the host-wrapper script should be invoked.
 
 ### ignore-schema
 
@@ -710,6 +735,8 @@ There are only 3 cases where non-default display widths are relevant:
 * Int-type columns using the `zerofill` modifier are padded with leading zeroes based on the display width. [lint-display-width](#lint-display-width) always ignores such columns.
 * Display widths are included in query result metadata, and in theory some applications may use this information programmatically, and intentionally have non-default display widths for this reason. This is quite rare, but in this situation it makes sense to use `lint-display-width=ignore`.
 
+MySQL 8.0.17 deprecated use of integer display widths, as well as the `zerofill` modifier. MySQL 8.0.19 removed display widths from appearance in `SHOW CREATE TABLE` and `information_schema` in most situations. As a result, [lint-display-width](#lint-display-width) has no effect in MySQL 8.0.19+ and Percona Server 8.0.19+.
+
 ### lint-dupe-index
 
 Commands | diff, push, lint, [CI](https://www.skeema.io/ci)
@@ -745,6 +772,18 @@ Companies that restrict foreign keys typically do so for these reasons:
 * Foreign keys introduce nontrivial write latency, due to the extra locking. In a high-write-volume OLTP environment, the performance impact can be quite substantial.
 * Foreign keys are problematic when using online schema change tools. Percona's pt-osc allows them, albeit with extra complexity and risk. Other popular OSC tools -- gh-ost, fb-osc, LHM -- don't support foreign keys at all.
 * Conceptually, foreign keys simply don't work across a sharded environment. Although they still function within a single shard, application-level checks become necessary anyway for cross-shard purposes. As a result, sharded companies tend to converge on application-level checks exclusively.
+
+### lint-has-float
+
+Commands | diff, push, lint, [CI](https://www.skeema.io/ci)
+--- | :---
+**Default** | "ignore"
+**Type** | enum
+**Restrictions** | Requires one of these values: "ignore", "warning", "error"
+
+This linter rule checks for table columns using data type FLOAT or DOUBLE. This option defaults to "ignore", meaning that these data types do not result in a linter annotation by default. However, companies that restrict or forbid use of floating-point types may wish to set this to "warning" or "error".
+
+Some companies forbid use of floating-point types because they can only store approximate values. For use-cases requiring exact precision, such as monetary data, the DECIMAL type should be used instead.
 
 ### lint-has-routine
 
@@ -812,6 +851,32 @@ If true, `skeema pull` will look for schemas (databases) that exist on the insta
 
 When using a workflow that involves running `skeema pull development` regularly, it may be useful to disable this option. For example, if the development environment tends to contain various extra schemas for testing purposes, set `skip-new-schemas` in a global or top-level .skeema file's `[development]` section to avoid storing these testing schemas in the filesystem.
 
+### partitioning
+
+Commands | diff, push, pull
+--- | :---
+**Default** | "keep"
+**Type** | enum
+**Restrictions** | Requires one of these values: "keep", "remove", "modify"
+
+Skeema v1.4.0 added diff support for partitioned tables. This option affects how DDL involving partitioned tables is generated or executed via `skeema diff` and `skeema push`.
+
+With the default value of "keep", tables may be partitioned (through the filesystem `CREATE TABLE` containing a `PARTITON BY` clause, either initially or one subsequently being added), but will never be de-partitioned or re-partitioned. In other words, once a table is partitioned in a database, with `partitioning=keep` Skeema suppresses further modifications to the partitioning clause for the table.
+
+With a value of "remove", tables will not be partitioned, and any already-partitioned tables will be de-partitioned. If any filesystem `CREATE TABLE` statements contain a `PARTITION BY` clause, it will effectively be ignored. Any already-partitioned tables in a database will automatically have DDL generated to de-partition them via `ALTER TABLE ... REMOVE PARTITIONING`.
+
+With a value of "modify", partitioning clauses are handled permissively. Tables will be partitioned, re-partitioned, or de-partitioned based on the presence of a `PARTITION BY` clause in the filesystem `CREATE TABLE` statement.
+
+Overall, the intended use of the [partitioning](#partitioning) option is as follows:
+
+* If you use partitioning in production but not in development (for example), place `partitioning=remove` in a `[development]` section of a top-level .skeema file. This will ensure that tables in your development databases are never partitioned, removing the need to run partition-management scripts in dev.
+* The default of `partitioning=keep` is useful in all environments where partitioning is actually in-use; it prevents accidental re-partitioning or de-partitioning. For example, if you choose to omit `PARTITION BY` clauses from your checked-in \*.sql files entirely, you can use `partitioning=keep` in environments with partitioning to prevent `skeema push` from ever de-partitioning any tables.
+* For one-off situations where you intentionally want to re-partition or de-partition an existing partitioned table, you can use `skeema push --partitioning=modify` as a command-line override.
+
+Regardless of this option, modifications to just the *partition list* of a partitioned table are always ignored for RANGE and LIST partitioning methods, and are unsupported for HASH and KEY methods. Skeema will not add or remove partitions from an already-partitioned table, regardless of differences between the filesystem `CREATE TABLE` and the table in a live database. The intended workflow is to use an external tool/cron for managing the partition list, e.g. to remove old time-based RANGE partitions and add new ones.
+
+When running `skeema pull` against an environment that uses `partitioning=remove`, the *.sql files will retain their previous `PARTITION BY` clauses as-is, despite the database tables lacking partitioning in such an environment. Aside from this, the [partitioning](#partitioning) option does not otherwise affect the behavior of `skeema pull`.
+
 ### password
 
 Commands | *all*
@@ -840,7 +905,7 @@ Specifies a nonstandard port to use when connecting to MySQL via TCP/IP.
 
 ### reuse-temp-schema
 
-Commands | diff, push, pull, lint
+Commands | diff, push, pull, lint, format
 --- | :---
 **Default** | false
 **Type** | boolean
@@ -848,9 +913,11 @@ Commands | diff, push, pull, lint
 
 When using the default of [workspace=temp-schema](#workspace), this option controls how to clean up temporary workspace schemas. See [the FAQ](faq.md#no-reliance-on-sql-parsing) for background on temporary workspace schemas.
 
-If false, the temporary workspace schema is dropped once it is no longer needed. If true, the schema will be kept in place, but will be emptied of tables.
+If false, the temporary workspace schema is dropped once it is no longer needed. If true, the schema will be kept in place, but will be emptied of tables and routines.
 
 This option has no effect with other values of the [workspace](#workspace) option, such as [workspace=docker](#workspace).
+
+This option is deprecated as of Skeema v1.4.0, since dropping the temporary workspace schema is a safer approach with no real drawbacks. Dropping the schema does not require any additional privilege grants, and is performed in a way that minimizes any potential performance impact.
 
 ### safe-below-size
 
@@ -887,6 +954,7 @@ Aside from the special case of `skeema init`, the [schema](#schema) option shoul
 * A single schema name
 * Multiple schema names, separated by commas
 * A single asterisk character `*`
+* A forward-slash-wrapped regular expression
 * A backtick-wrapped command line to execute; the command's STDOUT will be split on a consistent delimiter (newline, tab, comma, or space) and each token will be treated as a schema name
 
 Most users will just use the first option, a single schema name.
@@ -895,7 +963,9 @@ The ability to specify multiple schema names is useful in sharded environments w
 
 Setting `schema=*` is a special value meaning "all non-system schemas on the database instance". This is the easiest choice for a multi-tenant sharded environment, where all non-system schemas have the exact same set of tables. The ignored system schemas include `information_schema`, `performance_schema`, `mysql`, `sys`, and `test`. Additional schemas may be ignored by using the [ignore-schema](#ignore-schema) option.
 
-Some sharded environments need more flexibility -- for example, where some schemas represent shards with common sets of tables but other schemas do not. In this case, set [schema](#schema) to a backtick-wrapped external command shellout. This permits the directory to be mapped to one or more schema names dynamically, based on the output of any arbitrary script or binary, such as a service discovery client. The command line may contain special variables, which Skeema will dynamically replace with appropriate values. See [options with variable interpolation](config.md#options-with-variable-interpolation) for more information. The following variables are supported for this option:
+In some sharded environments, it is easier to express a dynamic set of schema names to *include*, rather than exclude. Setting the schema value to a forward-slash-wrapped regular expression accomplishes this. For example, `schema=/^foo/` will map this directory to all schema names beginning with prefix "foo". This approach is useful when some schemas (with a common naming convention) represent shards with the same set of tables, while other special unsharded schemas are also present.
+
+Some sharded environments may need even more flexibility -- for example, when the sharding scheme does not follow a consistent naming pattern. In this case, set [schema](#schema) to a backtick-wrapped external command shellout. This permits the directory to be mapped to one or more schema names dynamically, based on the output of any arbitrary script or binary, such as a service discovery client. The command line may contain special variables, which Skeema will dynamically replace with appropriate values. See [options with variable interpolation](config.md#options-with-variable-interpolation) for more information. The following variables are supported for this option:
 
 * `{HOST}` -- hostname (or IP) for the database instance being processed
 * `{PORT}` -- port number for the database instance being processed
@@ -906,7 +976,7 @@ Some sharded environments need more flexibility -- for example, where some schem
 * `{DIRNAME}` -- The base name (last path element) of the directory being processed. May be useful as a key in a service discovery lookup.
 * `{DIRPATH}` -- The full (absolute) path of the directory being processed.
 
-Regardless of which form of the [schema](#schema) option is used, the [ignore-schema](#ignore-schema) option is applied as a regex "filter" against it, potentially removing some of the listed schema names based on the configuration.
+Regardless of which form of the [schema](#schema) option is used, the [ignore-schema](#ignore-schema) option is applied last as a regex "filter" against it, potentially removing some of the listed schema names based on the configuration.
 
 ### socket
 
@@ -920,7 +990,7 @@ When the [host option](#host) is "localhost", this option specifies the path to 
 
 ### temp-schema
 
-Commands | diff, push, pull, lint
+Commands | diff, push, pull, lint, format
 --- | :---
 **Default** | "_skeema_tmp"
 **Type** | string
@@ -929,6 +999,44 @@ Commands | diff, push, pull, lint
 Specifies the name of the temporary schema used for Skeema workspace operations. See [the FAQ](faq.md#no-reliance-on-sql-parsing) for more information on how this schema is used.
 
 If using a non-default value for this option, it should not ever point at a schema containing real application data. Skeema will automatically detect this and abort in this situation, but may first drop any *empty* tables that it found in the schema.
+
+### temp-schema-binlog
+
+Commands | diff, push, pull, lint, format
+--- | :---
+**Default** | "auto"
+**Type** | enum
+**Restrictions** | Requires one of these values: "on", "off", "auto"
+
+With [workspace=temp-schema](#workspace), this option controls whether or not workspace operations are written to the database's binary log, which means they will be executed on replicas if replication is configured.
+
+If possible, it is generally preferable to avoid replication of workspace queries. The workspace schema is "cleaned up" (dropped in a safe manner) after processing each directory, and typically Skeema should be configured to only interact with master databases anyway, so replicating the workspace queries serves no purpose. However, the ability to selectively skip binary logging requires either the SUPER privilege or (in MySQL 8.0+) the SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN privileges. These superuser privileges may be unavailable in database-as-a-service environments, such as Amazon RDS.
+
+With a value of "on", Skeema will not do any special handling for workspace queries, meaning that they **will** be written to the binlog and be executed by replicas. This value is guaranteed to work regardless of user privileges.
+
+With a value of "off", Skeema will skip binary logging (via `SET SESSION sql_log_bin=0`) for workspace queries, meaning that they **will not** be written to the binlog or executed by replicas. If Skeema's user lacks sufficient superuser privileges, a fatal error will be returned.
+
+With the default value of "auto", Skeema will detect whether the configured user has sufficient privileges to skip binary logging of workspace queries, and will do so if available. In other words, "auto" functions as "off" if running as a privileged superuser, or "on" otherwise.
+
+This option has no effect if the database's binary log is already globally disabled.
+
+This option does *not* impact non-workspace-related queries executed by `skeema push`.
+
+### temp-schema-threads
+
+Commands | diff, push, pull, lint, format
+--- | :---
+**Default** | 5
+**Type** | int
+**Restrictions** | Must be a positive integer
+
+With [workspace=temp-schema](#workspace), this option controls the concurrency level for CREATE queries when populating the workspace, as well as DROP queries when cleaning up the workspace.
+
+When using Skeema in situations involving high object counts (hundreds or thousands of tables and routines in a single schema) and/or nontrivial latency between Skeema and the database server (running Skeema locally against a database server in a remote data center), increasing this value may improve Skeema's performance.
+
+In other cases, it may be beneficial to *lower* this value. Some high-volume OLTP workloads are especially sensitive to contention for InnoDB's dict_sys mutex, meaning that the default concurrency level of 5 can cause other application queries to pile up or stall. This mutex contention is more prevalent in pre-MySQL 8.0 systems, especially if the combination of table count and connection count overwhelms the system's `table_open_cache`, and/or there are many INSERTs to table(s) lacking a primary key.
+
+In either situation, also consider use of [workspace=docker](#workspace) as an alternative solution.
 
 ### user
 
@@ -968,7 +1076,7 @@ In Skeema v1.2 the default value of this option was "bad-charset,bad-engine,no-p
 
 ### workspace
 
-Commands | diff, push, pull, lint
+Commands | diff, push, pull, lint, format
 --- | :---
 **Default** | "temp-schema"
 **Type** | enum
@@ -979,9 +1087,10 @@ This option controls where workspace schemas are created. See [the FAQ](faq.md#n
 * `skeema diff`
 * `skeema push`
 * `skeema lint`
+* `skeema format`
 * `skeema pull` (only if [skip-format](#format) is used)
 
-With the default value of [workspace=temp-schema](#workspace), a temporary schema is created on each MySQL instance that Skeema interacts with. The schema name is configured by the [temp-schema](#temp-schema) option. When the schema is no longer needed, it is dropped, unless the [reuse-temp-schema](#reuse-temp-schema) option is enabled.
+With the default value of [workspace=temp-schema](#workspace), a temporary schema is created on each MySQL instance that Skeema interacts with. The schema name is configured by the [temp-schema](#temp-schema) option. When the schema is no longer needed, it is dropped, unless the deprecated [reuse-temp-schema](#reuse-temp-schema) option is enabled.
 
 With [workspace=docker](#workspace), a Docker container on localhost is used for the workspace instead. This can be advantageous for two reasons:
 

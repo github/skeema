@@ -20,7 +20,7 @@ import (
 type IntegrationTestSuite interface {
 	Setup(backend string) error
 	Teardown(backend string) error
-	BeforeTest(method string, backend string) error
+	BeforeTest(backend string) error
 }
 
 // RunSuite runs all test methods in the supplied suite once per backend. It
@@ -53,13 +53,13 @@ func RunSuite(suite IntegrationTestSuite, t *testing.T, backends []string) {
 		for n := 0; n < suiteType.NumMethod(); n++ {
 			method := suiteType.Method(n)
 			if strings.HasPrefix(method.Name, "Test") {
-				if err := suite.BeforeTest(method.Name, backend); err != nil {
-					suite.Teardown(backend)
-					t.Fatalf("RunSuite %s: BeforeTest(%s, %s) failed: %s", suiteName, method.Name, backend, err)
-				}
 				subtestName := fmt.Sprintf("%s.%s:%s", suiteName, method.Name, backend)
-				subtest := func(t *testing.T) {
-					method.Func.Call([]reflect.Value{reflect.ValueOf(suite), reflect.ValueOf(t)})
+				subtest := func(subt *testing.T) {
+					if err := suite.BeforeTest(backend); err != nil {
+						suite.Teardown(backend)
+						t.Fatalf("RunSuite %s: BeforeTest(%s) failed: %s", suiteName, backend, err)
+					}
+					method.Func.Call([]reflect.Value{reflect.ValueOf(suite), reflect.ValueOf(subt)})
 				}
 				t.Run(subtestName, subtest)
 			}

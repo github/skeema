@@ -13,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/VividCortex/mysqlerr"
 	"github.com/jmoiron/sqlx"
+	"github.com/nozzle/throttler"
 	log "github.com/sirupsen/logrus"
 	"github.com/skeema/skeema/fs"
 	"github.com/skeema/tengo"
@@ -83,6 +85,8 @@ type Options struct {
 	RootPassword        string    // only TypeLocalDocker
 	PrefabWorkspace     Workspace // only TypePrefab
 	LockWaitTimeout     time.Duration
+	Concurrency         int
+	SkipBinlog          bool
 }
 
 // New returns a pointer to a ready-to-use Workspace, using the configuration
@@ -103,8 +107,8 @@ func New(opts Options) (Workspace, error) {
 // A non-nil instance should be supplied, unless the caller already knows the
 // workspace won't be temp-schema based.
 // This method relies on option definitions from util.AddGlobalOptions(),
-// including "workspace", "temp-schema", "flavor", "docker-cleanup", and
-// "reuse-temp-schema".
+// including "workspace", "temp-schema", "flavor", "docker-cleanup",
+// "reuse-temp-schema", "temp-schema-threads", "temp-schema-binlog"
 func OptionsForDir(dir *fs.Dir, instance *tengo.Instance) (Options, error) {
 	requestedType, err := dir.Config.GetEnum("workspace", "temp-schema", "docker")
 	if err != nil {
@@ -114,12 +118,14 @@ func OptionsForDir(dir *fs.Dir, instance *tengo.Instance) (Options, error) {
 		CleanupAction:   CleanupActionNone,
 		SchemaName:      dir.Config.Get("temp-schema"),
 		LockWaitTimeout: 30 * time.Second,
+		Concurrency:     10,
 	}
 	if requestedType == "docker" {
 		opts.Type = TypeLocalDocker
 		opts.Flavor = tengo.NewFlavor(dir.Config.Get("flavor"))
+		opts.SkipBinlog = true
 		if !opts.Flavor.Known() && instance != nil {
-			opts.Flavor = instance.Flavor()
+			opts.Flavor = instance.Flavor().Family()
 		}
 		opts.ContainerName = fmt.Sprintf("skeema-%s", strings.Replace(opts.Flavor.String(), ":", "-", -1))
 		if cleanup, err := dir.Config.GetEnum("docker-cleanup", "none", "stop", "destroy"); err != nil {
@@ -138,6 +144,19 @@ func OptionsForDir(dir *fs.Dir, instance *tengo.Instance) (Options, error) {
 		if !dir.Config.GetBool("reuse-temp-schema") {
 			opts.CleanupAction = CleanupActionDrop
 		}
+		if concurrency, err := dir.Config.GetInt("temp-schema-threads"); err != nil {
+			return Options{}, err
+		} else if concurrency < 1 {
+			return Options{}, errors.New("temp-schema-threads cannot be less than 1")
+		} else {
+			opts.Concurrency = concurrency
+		}
+		binlogEnum, err := dir.Config.GetEnum("temp-schema-binlog", "on", "off", "auto")
+		if err != nil {
+			return Options{}, err
+		}
+		opts.SkipBinlog = (binlogEnum == "off" || (binlogEnum == "auto" && instance.CanSkipBinlog()))
+
 		// Note: no support for opts.DefaultConnParams for temp-schema because the
 		// supplied instance already has default params
 	}
@@ -247,58 +266,53 @@ func ExecLogicalSchema(logicalSchema *fs.LogicalSchema, opts Options) (wsSchema 
 		}
 	}()
 
-	// We need two separate connection pools: one with normal session settings,
-	// and another that removes the Skeema-specific sql_mode override. The latter
-	// is needed for object types that "remember" their creation-time sql_mode.
-	db, err := ws.ConnectionPool("")
-	if err != nil {
-		fatalErr = fmt.Errorf("Cannot connect to workspace: %s", err)
-		return
-	}
-	dbRemember, err := ws.ConnectionPool("sql_mode=@@GLOBAL.sql_mode")
-	if err != nil {
-		fatalErr = fmt.Errorf("Cannot connect to workspace: %s", err)
-		return
-	}
-	rememberSQLMode := map[tengo.ObjectType]bool{
-		tengo.ObjectTypeFunc: true,
-		tengo.ObjectTypeProc: true,
-		//tengo.ObjectTypeEvent: true,   // not implemented yet
-		//tengo.ObjectTypeTrigger: true, // not implemented yet
+	// Run CREATEs in parallel
+	th := throttler.New(opts.Concurrency, len(logicalSchema.Creates))
+	for _, stmt := range logicalSchema.Creates {
+		db, err := ws.ConnectionPool(paramsForStatement(stmt, opts))
+		if err != nil {
+			fatalErr = fmt.Errorf("Cannot connect to workspace: %s", err)
+			return
+		}
+		go func(db *sqlx.DB, statement *fs.Statement) {
+			_, err := db.Exec(statement.Body())
+			if err != nil {
+				err = wrapFailure(statement, err)
+			}
+			th.Done(err)
+		}(db, stmt)
+		th.Throttle()
 	}
 
-	// Run all CREATEs in parallel. Temporarily limit max open conns as a simple
-	// means of limiting concurrency.
-	defer db.SetMaxOpenConns(0)
-	defer dbRemember.SetMaxOpenConns(0)
-	db.SetMaxOpenConns(10)
-	dbRemember.SetMaxOpenConns(10)
-	results := make(chan *StatementError)
-	for _, stmt := range logicalSchema.Creates {
-		go func(statement *fs.Statement) {
-			if rememberSQLMode[statement.ObjectType] {
-				results <- execStatement(dbRemember, statement)
-			} else {
-				results <- execStatement(db, statement)
-			}
-		}(stmt)
-	}
+	// Construct the workspace.Schema and then examine statement errors. If any
+	// deadlocks occurred, retry them sequentially, since some deadlocks are
+	// expected from concurrent CREATEs in MySQL 8+ if FKs are present.
 	wsSchema = &Schema{
 		LogicalSchema: logicalSchema,
 		Failures:      []*StatementError{},
 	}
-	for range logicalSchema.Creates {
-		if result := <-results; result != nil {
-			wsSchema.Failures = append(wsSchema.Failures, result)
+	sequentialStatements := []*fs.Statement{}
+	for _, err := range th.Errs() {
+		stmterr := err.(*StatementError)
+		if tengo.IsDatabaseError(stmterr.Err, mysqlerr.ER_LOCK_DEADLOCK) {
+			sequentialStatements = append(sequentialStatements, stmterr.Statement)
+		} else {
+			wsSchema.Failures = append(wsSchema.Failures, stmterr)
 		}
 	}
-	close(results)
 
 	// Run ALTERs sequentially, since foreign key manipulations don't play
 	// nice with concurrency.
-	for _, statement := range logicalSchema.Alters {
-		if err := execStatement(db, statement); err != nil {
-			wsSchema.Failures = append(wsSchema.Failures, err)
+	sequentialStatements = append(sequentialStatements, logicalSchema.Alters...)
+
+	for _, statement := range sequentialStatements {
+		db, connErr := ws.ConnectionPool(paramsForStatement(statement, opts))
+		if connErr != nil {
+			fatalErr = fmt.Errorf("Cannot connect to workspace: %s", connErr)
+			return
+		}
+		if _, err := db.Exec(statement.Body()); err != nil {
+			wsSchema.Failures = append(wsSchema.Failures, wrapFailure(statement, err))
 		}
 	}
 
@@ -306,17 +320,50 @@ func ExecLogicalSchema(logicalSchema *fs.LogicalSchema, opts Options) (wsSchema 
 	return
 }
 
-func execStatement(db *sqlx.DB, statement *fs.Statement) (stmtErr *StatementError) {
-	_, err := db.Exec(statement.Body())
-	if err == nil {
-		return nil
+// paramsForStatement returns the session settings for executing the supplied
+// statement in a workspace.
+func paramsForStatement(statement *fs.Statement, opts Options) string {
+	var params []string
+
+	// Disable binlogging if requested
+	if opts.SkipBinlog {
+		params = append(params, "sql_log_bin=0")
 	}
-	stmtErr = &StatementError{
+
+	// Disable FK checks when operating on tables, since otherwise DDL would
+	// need to be ordered to resolve dependencies, and circular references would
+	// be highly problematic
+	if statement.ObjectType == tengo.ObjectTypeTable {
+		params = append(params, "foreign_key_checks=0")
+	}
+
+	// Some object types "remember" their creation-time sql_mode, so we need to
+	// disable Skeema's usual sql_mode override before creating them
+	if statement.Type == fs.StatementTypeCreate {
+		rememberSQLMode := map[tengo.ObjectType]bool{
+			tengo.ObjectTypeFunc: true,
+			tengo.ObjectTypeProc: true,
+			//tengo.ObjectTypeEvent: true,   // not implemented yet
+			//tengo.ObjectTypeTrigger: true, // not implemented yet
+		}
+		if rememberSQLMode[statement.ObjectType] {
+			params = append(params, "sql_mode=@@GLOBAL.sql_mode")
+		}
+	}
+
+	return strings.Join(params, "&")
+}
+
+func wrapFailure(statement *fs.Statement, err error) *StatementError {
+	stmtErr := &StatementError{
 		Statement: statement,
-		Err:       fmt.Errorf("Error executing DDL in workspace: %s", err),
 	}
 	if tengo.IsSyntaxError(err) {
 		stmtErr.Err = fmt.Errorf("SQL syntax error: %s", err)
+	} else if tengo.IsDatabaseError(err, mysqlerr.ER_LOCK_DEADLOCK) {
+		stmtErr.Err = err // Need to maintain original type
+	} else {
+		stmtErr.Err = fmt.Errorf("Error executing DDL in workspace: %s", err)
 	}
 	return stmtErr
 }
