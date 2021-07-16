@@ -9,13 +9,14 @@ import (
 // Index represents a single index (primary key, unique secondary index, or non-
 // unique secondard index) in a table.
 type Index struct {
-	Name       string      `json:"name"`
-	Parts      []IndexPart `json:"parts"`
-	PrimaryKey bool        `json:"primaryKey,omitempty"`
-	Unique     bool        `json:"unique,omitempty"`
-	Invisible  bool        `json:"invisible,omitempty"`
-	Comment    string      `json:"comment,omitempty"`
-	Type       string      `json:"type"`
+	Name           string      `json:"name"`
+	Parts          []IndexPart `json:"parts"`
+	PrimaryKey     bool        `json:"primaryKey,omitempty"`
+	Unique         bool        `json:"unique,omitempty"`
+	Invisible      bool        `json:"invisible,omitempty"`
+	Comment        string      `json:"comment,omitempty"`
+	Type           string      `json:"type"`
+	FullTextParser string      `json:"parser,omitempty"`
 }
 
 // IndexPart represents an individual indexed column or expression. Each index
@@ -34,7 +35,7 @@ func (idx *Index) Definition(flavor Flavor) string {
 	for n := range idx.Parts {
 		parts[n] = idx.Parts[n].Definition(flavor)
 	}
-	var typeAndName, comment, invis string
+	var typeAndName, comment, invis, parser string
 	if idx.PrimaryKey {
 		if !idx.Unique {
 			panic(errors.New("Index is primary key, but isn't marked as unique"))
@@ -53,7 +54,12 @@ func (idx *Index) Definition(flavor Flavor) string {
 	if idx.Invisible {
 		invis = " /*!80000 INVISIBLE */"
 	}
-	return fmt.Sprintf("%s (%s)%s%s", typeAndName, strings.Join(parts, ","), comment, invis)
+	if idx.Type == "FULLTEXT" && idx.FullTextParser != "" {
+		// Note the trailing space here is intentional -- it's always present in SHOW
+		// CREATE TABLE for this particular clause
+		parser = fmt.Sprintf(" /*!50100 WITH PARSER `%s` */ ", idx.FullTextParser)
+	}
+	return fmt.Sprintf("%s (%s)%s%s%s", typeAndName, strings.Join(parts, ","), comment, invis, parser)
 }
 
 // Equals returns true if two indexes are completely identical, false otherwise.
@@ -73,25 +79,8 @@ func (idx *Index) EqualsIgnoringVisibility(other *Index) bool {
 	return idx.Name == other.Name && idx.Comment == other.Comment && idx.Equivalent(other)
 }
 
-// OnlyVisibilityDiffers returns true if idx and other have different values
-// for Invisible, but otherwise are equal.
-func (idx *Index) OnlyVisibilityDiffers(other *Index) bool {
-	if idx == nil || other == nil {
-		return false
-	}
-	return idx.Invisible != other.Invisible && idx.EqualsIgnoringVisibility(other)
-}
-
-// Equivalent returns true if two Indexes are functionally equivalent,
-// regardless of whether or not they have the same names, comments, or
-// visibility.
-func (idx *Index) Equivalent(other *Index) bool {
-	if idx == nil || other == nil {
-		return idx == other // only equivalent if BOTH are nil
-	}
-	if idx.PrimaryKey != other.PrimaryKey || idx.Unique != other.Unique || idx.Type != other.Type {
-		return false
-	}
+// sameParts returns true if two Indexes' Parts slices are identical.
+func (idx *Index) sameParts(other *Index) bool {
 	if len(idx.Parts) != len(other.Parts) {
 		return false
 	}
@@ -103,23 +92,42 @@ func (idx *Index) Equivalent(other *Index) bool {
 	return true
 }
 
+// Equivalent returns true if two Indexes are functionally equivalent,
+// regardless of whether or not they have the same names, comments, or
+// visibility.
+func (idx *Index) Equivalent(other *Index) bool {
+	if idx == nil || other == nil {
+		return idx == other // only equivalent if BOTH are nil
+	}
+	if idx.PrimaryKey != other.PrimaryKey || idx.Unique != other.Unique || idx.Type != other.Type || idx.FullTextParser != other.FullTextParser {
+		return false
+	}
+	return idx.sameParts(other)
+}
+
 // RedundantTo returns true if idx is equivalent to, or a strict subset of,
 // other. Both idx and other should be indexes of the same table.
-// Uniqueness and sub-parts are accounted for in the logic; for example, a
-// unique index is not considered redundant with a non-unique index having
-// the same or more cols. A primary key is never redundant, although another
-// unique index may be redundant to the primary key.
+// A non-unique index is considered redundant to any other index having the
+// same (or more) columns in the same order, unless its parts have a greater
+// column prefix length. A unique index can only be redundant to the primary key
+// or an exactly equivalent unique index; another unique index with more cols
+// may coexist due to the desired constraint semantics. A primary key is never
+// redundant to another index.
 func (idx *Index) RedundantTo(other *Index) bool {
 	if idx == nil || other == nil {
 		return false
 	}
-	if idx.PrimaryKey || (idx.Unique && !other.Unique) || idx.Type != other.Type {
+	if idx.PrimaryKey || (idx.Unique && !other.Unique) || idx.Type != other.Type || idx.FullTextParser != other.FullTextParser {
 		return false
 	}
 	if !idx.Invisible && other.Invisible {
 		return false // a visible index is never redundant to an invisible one
 	}
-	if idx.Type == "FULLTEXT" && len(idx.Parts) != len(other.Parts) {
+	if idx.Unique && other.Unique {
+		// Since unique indexes are also unique *constraints*, two unique indexes are
+		// non-redundant unless they have identical parts.
+		return idx.sameParts(other)
+	} else if idx.Type == "FULLTEXT" && len(idx.Parts) != len(other.Parts) {
 		return false // FT composite indexes don't behave like BTREE in terms of left-right prefixing
 	} else if len(idx.Parts) > len(other.Parts) {
 		return false // can't be redundant to an index with fewer cols

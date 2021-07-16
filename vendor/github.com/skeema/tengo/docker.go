@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -194,6 +195,16 @@ func (di *DockerizedInstance) Start() error {
 	err := di.Manager.client.StartContainer(di.container.ID, nil)
 	if _, ok := err.(*docker.ContainerAlreadyRunning); err == nil || ok {
 		di.container, err = di.Manager.client.InspectContainer(di.container.ID)
+
+		// In some cases it appears StartContainer returns prior to the port mapping
+		// being in place. Retry the inspection up to 5 more times if so.
+		for n := 1; err == nil && di.Port() == 0; n++ {
+			if n >= 6 {
+				return fmt.Errorf("Unable to find port mapping for container %s", di.Name)
+			}
+			time.Sleep(time.Duration(n) * time.Millisecond)
+			di.container, err = di.Manager.client.InspectContainer(di.container.ID)
+		}
 	}
 	return err
 }
@@ -202,6 +213,7 @@ func (di *DockerizedInstance) Start() error {
 // destroy the container. The connection pool will be removed. If the container
 // was not already running, nil will be returned.
 func (di *DockerizedInstance) Stop() error {
+	di.CloseAll()
 	err := di.Manager.client.StopContainer(di.container.ID, 10)
 	if _, ok := err.(*docker.ContainerNotRunning); !ok && err != nil {
 		return err
@@ -211,6 +223,7 @@ func (di *DockerizedInstance) Stop() error {
 
 // Destroy stops and deletes the corresponding containerized mysql-server.
 func (di *DockerizedInstance) Destroy() error {
+	di.CloseAll()
 	rcopts := docker.RemoveContainerOptions{
 		ID:            di.container.ID,
 		Force:         true,
@@ -292,6 +305,31 @@ func (di *DockerizedInstance) SourceSQL(filePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("SourceSQL %s: Unable to open setup file %s: %s", di, filePath, err)
 	}
+	defer f.Close()
+	stdoutStr, err := di.Source(f)
+	if err != nil {
+		return stdoutStr, fmt.Errorf("SourceSQL %s: Error sourcing file %s: %v", di, filePath, err)
+	}
+	return stdoutStr, nil
+}
+
+// SourceString reads the specified string and executes it against the containerized
+// mysql-server. The string should contain one or more valid SQL instructions,
+// typically a mix of DML and/or DDL statements. It is useful as a per-test
+// setup method in implementations of IntegrationTestSuite.BeforeTest.
+func (di *DockerizedInstance) SourceString(str string) (string, error) {
+	stdoutStr, err := di.Source(strings.NewReader(str))
+	if err != nil {
+		return stdoutStr, fmt.Errorf("SourceString %s: Error sourcing string %s: %v", di, str, err)
+	}
+	return stdoutStr, nil
+}
+
+// Source reads from the io.Reader and executes it against the containerized
+// mysql-server. The io.Reader should contain one or more valid SQL instructions,
+// typically a mix of DML and/or DDL statements. It is useful as a per-test
+// setup method in implementations of IntegrationTestSuite.BeforeTest.
+func (di *DockerizedInstance) Source(reader io.Reader) (string, error) {
 	cmd := []string{"mysql", "-tvvv", "-u", "root"}
 	if di.RootPassword != "" {
 		cmd = append(cmd, fmt.Sprintf("-p%s", di.RootPassword))
@@ -311,7 +349,7 @@ func (di *DockerizedInstance) SourceSQL(filePath string) (string, error) {
 	seopts := docker.StartExecOptions{
 		OutputStream: &stdout,
 		ErrorStream:  &stderr,
-		InputStream:  f,
+		InputStream:  reader,
 	}
 	if err = di.Manager.client.StartExec(exec.ID, seopts); err != nil {
 		return "", err
@@ -319,7 +357,7 @@ func (di *DockerizedInstance) SourceSQL(filePath string) (string, error) {
 	stdoutStr := stdout.String()
 	stderrStr := strings.Replace(stderr.String(), "Warning: Using a password on the command line interface can be insecure.\n", "", 1)
 	if strings.Contains(stderrStr, "ERROR") {
-		return stdoutStr, fmt.Errorf("SourceSQL %s: Error sourcing file %s: %s", di, filePath, stderrStr)
+		return stdoutStr, errors.New(stderrStr)
 	}
 	return stdoutStr, nil
 }
@@ -330,8 +368,10 @@ type filteredLogger struct {
 
 func (fl filteredLogger) Print(v ...interface{}) {
 	for _, arg := range v {
-		if err, ok := arg.(error); ok && strings.Contains(err.Error(), "EOF") {
-			return
+		if err, ok := arg.(error); ok {
+			if msg := err.Error(); strings.Contains(msg, "EOF") || strings.Contains(msg, "unexpected read") {
+				return
+			}
 		}
 	}
 	fl.logger.Print(v...)

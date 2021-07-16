@@ -78,6 +78,7 @@ type StatementModifiers struct {
 	AlgorithmClause        string           // Include an ALGORITHM=[value] clause in generated ALTER TABLE
 	IgnoreTable            *regexp.Regexp   // Generate blank DDL if table name matches this regexp
 	StrictIndexOrder       bool             // If true, maintain index order even in cases where there is no functional difference
+	StrictCheckOrder       bool             // If true, maintain check constraint order even though it never has a functional difference
 	StrictForeignKeyNaming bool             // If true, maintain foreign key names even if no functional difference in definition
 	CompareMetadata        bool             // If true, compare creation-time sql_mode and db collation for funcs, procs (and eventually events, triggers)
 	VirtualColValidation   bool             // If true, add WITH VALIDATION clause for ALTER TABLE affecting virtual columns
@@ -127,9 +128,8 @@ func compareTables(from, to *Schema) []*TableDiff {
 		td := NewAlterTable(fromTable, toTable)
 		if td != nil {
 			otherAlter, addFKAlter := td.SplitAddForeignKeys()
-			if otherAlter != nil {
-				tableDiffs = append(tableDiffs, otherAlter)
-			}
+			alters := otherAlter.SplitConflicts()
+			tableDiffs = append(tableDiffs, alters...)
 			if addFKAlter != nil {
 				addFKAlters = append(addFKAlters, addFKAlter)
 			}
@@ -463,6 +463,57 @@ func (td *TableDiff) SplitAddForeignKeys() (*TableDiff, *TableDiff) {
 	return result1, result2
 }
 
+// SplitConflicts looks through a TableDiff's alterClauses and pulls out any
+// clauses that need to be placed into a separate TableDiff in order to yield
+// legal or error-free DDL. Currently this only handles attempts to add multiple
+// FULLTEXT indexes in a single ALTER, but may handle additional cases in the
+// future.
+// This method returns a slice of TableDiffs. The first element will be
+// equivalent to the receiver (td) with any conflicting clauses removed;
+// subsequent slice elements, if any, will be separate TableDiffs each
+// consisting of individual conflicting clauses.
+// This method does not interact with AddForeignKey clauses; see dedicated
+// method SplitAddForeignKeys for that logic.
+func (td *TableDiff) SplitConflicts() (result []*TableDiff) {
+	if td == nil {
+		return nil
+	} else if td.Type != DiffTypeAlter || !td.supported || len(td.alterClauses) == 0 {
+		return []*TableDiff{td}
+	}
+
+	var seenAddFulltext bool
+	keepClauses := make([]TableAlterClause, 0, len(td.alterClauses))
+	separateClauses := make([]TableAlterClause, 0)
+	for _, clause := range td.alterClauses {
+		if addIndex, ok := clause.(AddIndex); ok && addIndex.Index.Type == "FULLTEXT" {
+			if seenAddFulltext {
+				separateClauses = append(separateClauses, clause)
+				continue
+			}
+			seenAddFulltext = true
+		}
+		keepClauses = append(keepClauses, clause)
+	}
+
+	result = append(result, &TableDiff{
+		Type:         DiffTypeAlter,
+		From:         td.From,
+		To:           td.To,
+		alterClauses: keepClauses,
+		supported:    true,
+	})
+	for n := range separateClauses {
+		result = append(result, &TableDiff{
+			Type:         DiffTypeAlter,
+			From:         td.From,
+			To:           td.To,
+			alterClauses: []TableAlterClause{separateClauses[n]},
+			supported:    true,
+		})
+	}
+	return result
+}
+
 // Statement returns the full DDL statement corresponding to the TableDiff. A
 // blank string may be returned if the mods indicate the statement should be
 // skipped. If the mods indicate the statement should be disallowed, it will
@@ -553,7 +604,7 @@ func (td *TableDiff) alterStatement(mods StatementModifiers) (string, error) {
 
 	// Force StrictIndexOrder to be enabled for InnoDB tables that have no primary
 	// key and at least one unique index with non-nullable columns
-	if !mods.StrictIndexOrder && td.To.ClusteredIndexKey() != td.To.PrimaryKey {
+	if !mods.StrictIndexOrder && td.To.Engine == "InnoDB" && td.To.ClusteredIndexKey() != td.To.PrimaryKey {
 		mods.StrictIndexOrder = true
 	}
 

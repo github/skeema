@@ -147,45 +147,34 @@ var normalizeCreateRegexps = []struct {
 	{re: regexp.MustCompile("`\\) KEY_BLOCK_SIZE=\\d+"), replacement: "`)"},
 }
 
-var reFindTableCharSet = regexp.MustCompile(`\n\).* DEFAULT CHARSET=(\w+)(?: COLLATE=(\w+))?`)
-
 // NormalizeCreateOptions adjusts the supplied CREATE TABLE statement to remove
 // any no-op table options that are persisted in SHOW CREATE TABLE, but not
 // reflected in information_schema and serve no purpose for InnoDB tables.
 // This function is not guaranteed to be safe for non-InnoDB tables.
 func NormalizeCreateOptions(createStmt string) string {
-	// Regex replacements
 	for _, entry := range normalizeCreateRegexps {
 		createStmt = entry.re.ReplaceAllString(createStmt, entry.replacement)
 	}
-
-	// Retained character set clauses: MySQL 8.0+ "remembers" column-level charset
-	// and collation when specified, even when equal to the table's default. We
-	// strip these because they're no-ops that aren't otherwise exposed in
-	// information_schema.
-	if matches := reFindTableCharSet.FindStringSubmatch(createStmt); matches != nil {
-		tableCharSet, tableCollation := matches[1], matches[2]
-		replace := ""
-		// If table collation is the default, we don't have enough information from
-		// just the CREATE TABLE to know what to strip. We hard-code the 3 most
-		// common cases though.
-		if tableCollation == "" {
-			commonDefaults := map[string]string{
-				"latin1":  "latin1_swedish_ci",
-				"utf8":    "utf8_general_ci",
-				"utf8mb4": "utf8mb4_0900_ai_ci", // No need to care about pre-8.0 different default in this situation!
-			}
-			tableCollation = commonDefaults[tableCharSet]
-		} else {
-			replace = fmt.Sprintf(" COLLATE %s", tableCollation)
-		}
-		if tableCollation != "" {
-			find := fmt.Sprintf(" CHARACTER SET %s COLLATE %s", tableCharSet, tableCollation)
-			createStmt = strings.Replace(createStmt, find, replace, -1)
-		}
-	}
-
 	return createStmt
+}
+
+// StripDisplayWidth removes integer display width from the supplied column
+// type string, in a way that matches MySQL 8.0.19+'s behavior. The input should
+// only be either an integer type or year(4) type; this function does NOT
+// confirm this.
+// No change is made to tinyint(1) types, nor types with a zerofill modifier, as
+// per handling in MySQL 8.0.19.
+func StripDisplayWidth(colType string) string {
+	input := strings.ToLower(colType)
+	openParen := strings.IndexRune(input, '(')
+	if openParen < 0 || input == "tinyint(1)" || strings.HasSuffix(input, "zerofill") {
+		return colType
+	}
+	var modifier string
+	if strings.HasSuffix(input, " unsigned") {
+		modifier = " unsigned"
+	}
+	return fmt.Sprintf("%s%s", input[0:openParen], modifier)
 }
 
 // baseDSN returns a DSN with the database (schema) name and params stripped.
@@ -214,4 +203,34 @@ func paramMap(dsn string) map[string]string {
 		result[key] = values.Get(key)
 	}
 	return result
+}
+
+// longestIncreasingSubsequence implements an algorithm useful in computing
+// diffs for column order or trigger order.
+func longestIncreasingSubsequence(input []int) []int {
+	if len(input) < 2 {
+		return input
+	}
+	candidateLists := make([][]int, 1, len(input))
+	candidateLists[0] = []int{input[0]}
+	for i := 1; i < len(input); i++ {
+		comp := input[i]
+		if comp < candidateLists[0][0] {
+			candidateLists[0][0] = comp
+		} else if longestList := candidateLists[len(candidateLists)-1]; comp > longestList[len(longestList)-1] {
+			newList := make([]int, len(longestList)+1)
+			copy(newList, longestList)
+			newList[len(longestList)] = comp
+			candidateLists = append(candidateLists, newList)
+		} else {
+			for j := len(candidateLists) - 2; j >= 0; j-- {
+				if thisList, nextList := candidateLists[j], candidateLists[j+1]; comp > thisList[len(thisList)-1] {
+					copy(nextList, thisList)
+					nextList[len(nextList)-1] = comp
+					break
+				}
+			}
+		}
+	}
+	return candidateLists[len(candidateLists)-1]
 }

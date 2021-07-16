@@ -1,33 +1,31 @@
 package main
 
 import (
-	"fmt"
 	"os"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/skeema/mybase"
-	"github.com/skeema/skeema/dumper"
-	"github.com/skeema/skeema/fs"
+	"github.com/skeema/skeema/internal/dumper"
+	"github.com/skeema/skeema/internal/fs"
 	"github.com/skeema/tengo"
 )
 
 func init() {
-	summary := "Save a DB instance's schemas and tables to the filesystem"
-	desc := `Creates a filesystem representation of the schemas and tables on a db instance.
-For each schema on the instance (or just the single schema specified by
---schema), a subdir with a .skeema config file will be created. Each directory
-will be populated with .sql files containing CREATE TABLE statements for every
-table in the schema.
-
-You may optionally pass an environment name as a CLI option. This will affect
-which section of .skeema config files the host and schema names are written to.
-For example, running ` + "`" + `skeema init staging` + "`" + ` will add config directives to the
-[staging] section of config files. If no environment name is supplied, the
-default is "production", so directives will be written to the [production]
-section of the file.`
+	summary := "Save a DB instance's schemas to the filesystem"
+	desc := "Creates a filesystem representation of the schemas on a DB instance. " +
+		"For each schema on the instance (or just the single schema specified by " +
+		"--schema), a subdir with a .skeema config file will be created. Each directory " +
+		"will be populated with .sql files containing CREATE statements for every " +
+		"table and routine in the schema.\n\n" +
+		"You may optionally pass an environment name as a CLI arg. This will affect " +
+		"which section of .skeema config files the host-related options are written to. " +
+		"For example, running `skeema init staging` will add config directives to the " +
+		"[staging] section of config files. If no environment name is supplied, the " +
+		"default is \"production\", so directives will be written to the [production] " +
+		"section of the file."
 
 	cmd := mybase.NewCommand("init", summary, desc, InitHandler)
 	cmd.AddOption(mybase.StringOption("host", 'h', "", "Database hostname or IP address"))
@@ -36,8 +34,14 @@ section of the file.`
 	cmd.AddOption(mybase.StringOption("dir", 'd', "<hostname>", "Subdir name to use for this host's schemas"))
 	cmd.AddOption(mybase.StringOption("schema", 0, "", "Only import the one specified schema; skip creation of subdirs for each schema"))
 	cmd.AddOption(mybase.BoolOption("include-auto-inc", 0, false, "Include starting auto-inc values in table files"))
-	cmd.AddOption(mybase.StringOption("ignore-schema", 0, "", "Ignore schemas that match regex"))
-	cmd.AddOption(mybase.StringOption("ignore-table", 0, "", "Ignore tables that match regex"))
+	cmd.AddOption(mybase.BoolOption("strip-partitioning", 0, false, "Omit PARTITION BY clause when writing partitioned tables to filesystem"))
+
+	// The temp-schema option is normally added via workspace.AddCommandOptions()
+	// only in subcommands that actually interact with workspaces. init doesn't use
+	// workspaces, but it just needs this one option to prevent accidental export
+	// of the temp-schema to the filesystem.
+	cmd.AddOption(mybase.StringOption("temp-schema", 't', "_skeema_tmp", "").Hidden())
+
 	cmd.AddArg("environment", "production", false)
 	CommandSuite.AddSubCommand(cmd)
 }
@@ -109,7 +113,7 @@ func isSystemSchema(name string) bool {
 		"performance_schema": true,
 		"sys":                true,
 	}
-	return systemSchemas[name]
+	return systemSchemas[strings.ToLower(name)]
 }
 
 func createHostDir(cfg *mybase.Config) (*fs.Dir, error) {
@@ -118,12 +122,7 @@ func createHostDir(cfg *mybase.Config) (*fs.Dir, error) {
 	}
 	hostDirName := cfg.Get("dir")
 	if !cfg.Changed("dir") { // default for dir is to base it on the hostname
-		port := cfg.GetIntOrDefault("port")
-		if port > 0 && cfg.Changed("port") {
-			hostDirName = fmt.Sprintf("%s:%d", cfg.Get("host"), port)
-		} else {
-			hostDirName = cfg.Get("host")
-		}
+		hostDirName = fs.HostDefaultDirName(cfg.Get("host"), cfg.GetIntOrDefault("port"))
 	}
 
 	dir, err := fs.ParseDir(".", cfg)
@@ -146,9 +145,10 @@ func createHostOptionFile(cfg *mybase.Config, hostDir *fs.Dir, inst *tengo.Insta
 	} else {
 		hostOptionFile.SetOptionValue(environment, "port", strconv.Itoa(inst.Port))
 	}
-	if flavor := inst.Flavor(); !flavor.Known() {
-		log.Warnf("Unable to automatically determine database vendor/version. To set manually, use the \"flavor\" option in %s", hostOptionFile)
-	} else {
+	if !cfg.Changed("generator") {
+		hostOptionFile.SetOptionValue("", "generator", generatorString())
+	}
+	if flavor := inst.Flavor(); flavor.Known() {
 		hostOptionFile.SetOptionValue(environment, "flavor", flavor.Family().String())
 	}
 	for _, persistOpt := range []string{"user", "ignore-schema", "ignore-table", "connect-options"} {
@@ -167,17 +167,6 @@ func createHostOptionFile(cfg *mybase.Config, hostDir *fs.Dir, inst *tengo.Insta
 		hostOptionFile.SetOptionValue("", "default-collation", schemas[0].Collation)
 	}
 
-	// By default, Skeema normally connects using strict sql_mode as well as
-	// innodb_strict_mode=1; see InstanceDefaultParams() in fs/dir.go. If existing
-	// tables aren't recreatable with those settings though, disable them.
-	var nonStrictWarning string
-	if !cfg.OnCLI("connect-options") {
-		if compliant, err := inst.StrictModeCompliant(schemas); err == nil && !compliant {
-			nonStrictWarning = fmt.Sprintf("Detected some tables are incompatible with strict-mode; setting relaxed connect-options in %s\n", hostOptionFile)
-			hostOptionFile.SetOptionValue(environment, "connect-options", "innodb_strict_mode=0,sql_mode='ONLY_FULL_GROUP_BY,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION'")
-		}
-	}
-
 	// Write the option file
 	if err := hostDir.CreateOptionFile(hostOptionFile); err != nil {
 		return NewExitValue(CodeCantCreate, "Unable to use directory %s: Unable to write to %s: %s", hostDir.Path, hostOptionFile.Path(), err)
@@ -187,14 +176,12 @@ func createHostOptionFile(cfg *mybase.Config, hostDir *fs.Dir, inst *tengo.Insta
 	if cfg.Changed("schema") {
 		suffix = "; skipping schema-level subdirs"
 	}
-	if nonStrictWarning == "" {
-		suffix += "\n"
-	}
-	log.Infof("Using host dir %s for %s%s", hostDir.Path, inst, suffix)
-	if nonStrictWarning != "" {
-		log.Warn(nonStrictWarning)
-	}
+	log.Infof("Using host dir %s for %s%s\n", hostDir.Path, inst, suffix)
 	return nil
+}
+
+func generatorString() string {
+	return "skeema:" + versionString()
 }
 
 // PopulateSchemaDir writes out *.sql files for all tables in the specified
@@ -219,7 +206,7 @@ func PopulateSchemaDir(s *tengo.Schema, parentDir *fs.Dir, makeSubdir bool) erro
 	var dir *fs.Dir
 	var err error
 	if makeSubdir {
-		optionFile := mybase.NewFile(path.Join(parentDir.Path, s.Name), ".skeema")
+		optionFile := mybase.NewFile(filepath.Join(parentDir.Path, s.Name), ".skeema")
 		optionFile.SetOptionValue("", "schema", s.Name)
 		optionFile.SetOptionValue("", "default-character-set", s.CharSet)
 		optionFile.SetOptionValue("", "default-collation", s.Collation)
@@ -238,6 +225,9 @@ func PopulateSchemaDir(s *tengo.Schema, parentDir *fs.Dir, makeSubdir bool) erro
 	dumpOpts.IgnoreTable, err = dir.Config.GetRegexp("ignore-table")
 	if err != nil {
 		return NewExitValue(CodeBadConfig, err.Error())
+	}
+	if dir.Config.GetBool("strip-partitioning") {
+		dumpOpts.Partitioning = tengo.PartitioningRemove
 	}
 
 	if _, err = dumper.DumpSchema(s, dir, dumpOpts); err != nil {

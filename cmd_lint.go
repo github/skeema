@@ -5,41 +5,39 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/skeema/mybase"
-	"github.com/skeema/skeema/dumper"
-	"github.com/skeema/skeema/fs"
-	"github.com/skeema/skeema/linter"
-	"github.com/skeema/skeema/workspace"
+	"github.com/skeema/skeema/internal/dumper"
+	"github.com/skeema/skeema/internal/fs"
+	"github.com/skeema/skeema/internal/linter"
+	"github.com/skeema/skeema/internal/workspace"
 	"github.com/skeema/tengo"
 )
 
 func init() {
 	summary := "Check for problems in filesystem representation of database objects"
-	desc := `Checks for problems in filesystem representation of database objects. A set of
-linter rules are run against all objects. Each rule may be configured to
-generate an error, a warning, or be ignored entirely. Statements that contain
-invalid SQL, or otherwise return an error from the database, are always flagged
-as linter errors.
-
-By default, this command also reformats statements to their canonical form,
-just like ` + "`skeema format`" + `.
-
-This command relies on accessing database instances to test the SQL DDL in a
-temporary location. See the workspace option for more information.
-
-You may optionally pass an environment name as a CLI option. This will affect
-which section of .skeema config files is used for linter configuration and
-workspace selection. For example, running ` + "`" + `skeema lint staging` + "`" + ` will
-apply config directives from the [staging] section of config files, as well as
-any sectionless directives at the top of the file. If no environment name is
-supplied, the default is "production".
-
-An exit code of 0 will be returned if no errors or warnings were emitted and all
-files were already formatted properly; 1 if any warnings were emitted and/or
-some files were reformatted; or 2+ if any errors were emitted for any reason.`
+	desc := "Checks for problems in filesystem representation of database objects. A set of " +
+		"linter rules are run against all objects. Each rule may be configured to " +
+		"generate an error, a warning, or be ignored entirely. Statements that contain " +
+		"invalid SQL, or otherwise return an error from the database, are always flagged " +
+		"as linter errors.\n\n" +
+		"By default, this command also reformats statements to their canonical form, " +
+		"just like `skeema format`.\n\n" +
+		"This command relies on accessing database instances to test the SQL DDL in a " +
+		"temporary location. See the --workspace option for more information.\n\n" +
+		"You may optionally pass an environment name as a CLI arg. This will affect " +
+		"which section of .skeema config files is used for linter configuration and " +
+		"workspace selection. For example, running `skeema lint staging` will " +
+		"apply config directives from the [staging] section of config files, as well as " +
+		"any sectionless directives at the top of the file. If no environment name is " +
+		"supplied, the default is \"production\".\n\n" +
+		"An exit code of 0 will be returned if no errors or warnings were emitted and all " +
+		"files were already formatted properly; 1 if any warnings were emitted and/or " +
+		"some files were reformatted; or 2+ if any errors were emitted for any reason."
 
 	cmd := mybase.NewCommand("lint", summary, desc, LintHandler)
 	linter.AddCommandOptions(cmd)
 	cmd.AddOption(mybase.BoolOption("format", 0, true, "Reformat SQL statements to match canonical SHOW CREATE"))
+	cmd.AddOption(mybase.BoolOption("strip-partitioning", 0, false, "Remove PARTITION BY clauses from *.sql files").Hidden())
+	workspace.AddCommandOptions(cmd)
 	cmd.AddArg("environment", "production", false)
 	CommandSuite.AddSubCommand(cmd)
 }
@@ -138,6 +136,8 @@ func lintDir(dir *fs.Dir) *linter.Result {
 		if wsType, _ := dir.Config.GetEnum("workspace", "temp-schema", "docker"); wsType != "docker" || !dir.Config.Changed("flavor") {
 			if inst, err = dir.FirstInstance(); err != nil {
 				return linter.BadConfigResult(dir, err)
+			} else if inst == nil {
+				return linter.BadConfigResult(dir, fmt.Errorf("No host defined for environment %q", dir.Config.Get("environment")))
 			}
 		}
 		if wsOpts, err = workspace.OptionsForDir(dir, inst); err != nil {
@@ -146,7 +146,7 @@ func lintDir(dir *fs.Dir) *linter.Result {
 	}
 
 	result := &linter.Result{}
-	for _, logicalSchema := range dir.LogicalSchemas {
+	for n, logicalSchema := range dir.LogicalSchemas {
 		// Convert the logical schema from the filesystem into a real schema, using a
 		// workspace
 		wsSchema, err := workspace.ExecLogicalSchema(logicalSchema, wsOpts)
@@ -158,15 +158,19 @@ func lintDir(dir *fs.Dir) *linter.Result {
 
 		// Reformat statements if requested. This must be done prior to checking for
 		// problems. Otherwise, the line offsets in annotations can be wrong.
-		if dir.Config.GetBool("format") {
+		// TODO: support format for multiple logical schemas per dir
+		if dir.Config.GetBool("format") && n == 0 {
 			dumpOpts := dumper.Options{
 				IncludeAutoInc: true,
 				IgnoreTable:    opts.IgnoreTable,
 			}
+			if dir.Config.GetBool("strip-partitioning") {
+				dumpOpts.Partitioning = tengo.PartitioningRemove
+			}
 			dumpOpts.IgnoreKeys(wsSchema.FailedKeys())
 			result.ReformatCount, err = dumper.DumpSchema(wsSchema.Schema, dir, dumpOpts)
 			if err != nil {
-				result.Fatal(err)
+				log.Errorf("Skipping format operation for %s: %s", dir, err)
 			}
 		}
 
@@ -174,6 +178,11 @@ func lintDir(dir *fs.Dir) *linter.Result {
 		subresult := linter.CheckSchema(wsSchema, opts)
 		result.Merge(subresult)
 	}
+
+	// Add warnings for any unsupported combinations of schema names, for example
+	// USE commands or dbname prefixes in CREATEs in a dir that also configures
+	// schema name in .skeema
+	result.AnnotateMixedSchemaNames(dir, opts)
 
 	// Add warning annotations for unparseable statements (unless we hit an
 	// exception, in which case skip it to avoid extra noise!)
@@ -190,4 +199,13 @@ func lintDir(dir *fs.Dir) *linter.Result {
 	// Make sure the problem messages have a deterministic order.
 	result.SortByFile()
 	return result
+}
+
+func countAndNoun(n int, singular, plural string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", singular)
+	} else if n == 0 {
+		return fmt.Sprintf("no %s", plural)
+	}
+	return fmt.Sprintf("%d %s", n, plural)
 }

@@ -8,32 +8,33 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/skeema/mybase"
-	"github.com/skeema/skeema/dumper"
-	"github.com/skeema/skeema/fs"
-	"github.com/skeema/skeema/workspace"
+	"github.com/skeema/skeema/internal/dumper"
+	"github.com/skeema/skeema/internal/fs"
+	"github.com/skeema/skeema/internal/workspace"
 	"github.com/skeema/tengo"
 )
 
 func init() {
-	summary := "Update the filesystem representation of schemas and tables"
-	desc := `Updates the existing filesystem representation of the schemas and tables on a DB
-instance. Use this command when changes have been applied to the database
-without using skeema, and the filesystem representation needs to be updated to
-reflect those changes.
-
-You may optionally pass an environment name as a CLI option. This will affect
-which section of .skeema config files is used for processing. For example,
-running ` + "`" + `skeema pull staging` + "`" + ` will apply config directives from the
-[staging] section of config files, as well as any sectionless directives at the
-top of the file. If no environment name is supplied, the default is
-"production".`
+	summary := "Update the filesystem representation of schemas"
+	desc := "Updates the existing filesystem representation of the schemas on a DB " +
+		"instance. Use this command when changes have been applied to the database " +
+		"manually or outside of Skeema, in order to make the filesystem representation " +
+		"reflect those changes.\n\n" +
+		"You may optionally pass an environment name as a CLI arg. This will affect " +
+		"which section of .skeema config files is used for processing. For example, " +
+		"running `skeema pull staging` will apply config directives from the " +
+		"[staging] section of config files, as well as any sectionless directives at the " +
+		"top of the file. If no environment name is supplied, the default is " +
+		"\"production\"."
 
 	cmd := mybase.NewCommand("pull", summary, desc, PullHandler)
 	cmd.AddOption(mybase.BoolOption("include-auto-inc", 0, false, "Include starting auto-inc values in new table files, and update in existing files"))
 	cmd.AddOption(mybase.BoolOption("format", 0, true, "Reformat SQL statements to match canonical SHOW CREATE"))
 	cmd.AddOption(mybase.BoolOption("normalize", 0, true, "(deprecated alias for format)").Hidden())
 	cmd.AddOption(mybase.BoolOption("new-schemas", 0, true, "Detect any new schemas and populate new dirs for them"))
-	cmd.AddOption(mybase.StringOption("partitioning", 0, "keep", "(slight pull impact of having partitioning=remove in .skeema file for diff/push)").Hidden())
+	cmd.AddOption(mybase.BoolOption("update-partitioning", 0, false, "Update PARTITION BY clauses in existing table files"))
+	cmd.AddOption(mybase.BoolOption("strip-partitioning", 0, false, "Omit PARTITION BY clause when writing partitioned tables to filesystem").Hidden())
+	workspace.AddCommandOptions(cmd)
 	cmd.AddArg("environment", "production", false)
 	CommandSuite.AddSubCommand(cmd)
 }
@@ -45,99 +46,105 @@ func PullHandler(cfg *mybase.Config) error {
 		return err
 	}
 
-	var skipCount int
-	if skipCount, err = pullWalker(dir, 5); err != nil {
-		return err
-	}
-	if skipCount == 0 {
-		return nil
-	}
-	var plural string
-	if skipCount > 1 {
-		plural = "s"
-	}
-	return NewExitValue(CodePartialError, "Skipped %d operation%s due to error%s", skipCount, plural, plural)
+	// pullWalker returns the "worst" (highest) exit code it encounters. We care
+	// about the exit code, but not the error message, since any error will already
+	// have been logged. (Multiple errors may have been encountered along the way,
+	// and it's simpler to log them when they occur, rather than needlessly
+	// collecting them.)
+	err = pullWalker(dir, 5)
+	return NewExitValue(ExitCode(err), "")
 }
 
-// pullWalker processes dir, and recursively calls itself on any subdirs. An
-// error is only returned if something fatal occurs. skipCount reflects the
-// number of non-fatal failed operations that were skipped for dir and its
-// subdirectories.
-func pullWalker(dir *fs.Dir, maxDepth int) (skipCount int, err error) {
+func pullWalker(dir *fs.Dir, maxDepth int) error {
+	if dir.ParseError != nil {
+		log.Warnf("Skipping %s: %s", dir, dir.ParseError)
+		return NewExitValue(CodeBadConfig, "")
+	}
+
 	var instance *tengo.Instance
+	var err error
 	if dir.Config.Changed("host") {
 		instance, err = dir.FirstInstance()
 		if err != nil {
 			log.Warnf("Skipping %s: %s", dir, err)
-			return 1, nil
+			return NewExitValue(CodePartialError, "")
 		}
 	}
 
-	// "flat" dir defining both host and schema
-	if instance != nil && dir.HasSchema() {
+	// dir defines a schema in .skeema, and/or has *.sql files
+	if dir.HasSchema() {
+		// If we cannot pull due to lack of an instance, make it clear to the user
+		if instance == nil {
+			log.Errorf("Skipping %s: No host defined for environment %q", dir, dir.Config.Get("environment"))
+			return NewExitValue(CodeBadConfig, "")
+		}
+
+		// Otherwise, we're in a "flat" dir that defines both host and schema: update
+		// the flavor if needed and process the pull operation on *.sql files, but no
+		// need to look for new schemas with this layout
 		updateFlavor(dir, instance)
-		_, err = pullSchemaDir(dir, instance)
-		return skipCount, err
+		updateGenerator(dir)
+		_, err := pullSchemaDir(dir, instance) // already logs err (if non-nil)
+		return err
 	}
 
 	subdirs, err := dir.Subdirs()
 	if err != nil {
 		log.Errorf("Cannot list subdirs of %s: %s", dir, err)
-		return skipCount + 1, nil
+		return NewExitValue(CodePartialError, "")
 	} else if len(subdirs) > 0 && maxDepth <= 0 {
-		log.Warnf("Not walking subdirs of %s: max depth reached", dir)
-		return skipCount + len(subdirs), nil
+		log.Errorf("Not walking subdirs of %s: max depth reached", dir)
+		return NewExitValue(CodePartialError, "")
 	}
 
-	wantNewSchemas := dir.Config.GetBool("new-schemas")
 	allSchemaNames := []string{}
 	for _, sub := range subdirs {
-		if sub.ParseError != nil {
-			log.Warnf("Skipping %s: %s", sub.Path, sub.ParseError)
-			skipCount++
-			wantNewSchemas = false // can't accurately detect bad subdir vs new schema
-			continue
-		}
-
 		// If dir does not define host, simply recurse into subdirs.
 		if instance == nil {
-			subSkipCount, subErr := pullWalker(sub, maxDepth-1)
-			skipCount += subSkipCount
-			if subErr != nil {
-				return skipCount, subErr
-			}
+			subErr := pullWalker(sub, maxDepth-1)
+			err = HighestExitCode(err, subErr)
 			continue
 		}
 
 		// Otherwise, dir defines host but not schema. Treat subdirs as schema dirs,
 		// and use the combined list of handled schemas to figure out whether any
 		// new schema dirs need to be created (if requested).
-		subSchemaNames, subErr := pullSchemaDir(sub, instance)
-		if subErr != nil {
-			return skipCount, subErr
-		}
+		subSchemaNames, subErr := pullSchemaDir(sub, instance) // already logs subErr (if non-nil)
+		err = HighestExitCode(err, subErr)
 		allSchemaNames = append(allSchemaNames, subSchemaNames...)
 	}
 
 	if instance != nil {
 		updateFlavor(dir, instance)
-		if wantNewSchemas {
-			err = findNewSchemas(dir, instance, allSchemaNames)
+		updateGenerator(dir)
+		if dir.Config.GetBool("new-schemas") && err == nil {
+			if err = findNewSchemas(dir, instance, allSchemaNames); err != nil {
+				log.Warnf("Unable to populate new schemas from %s: %s", dir, err)
+				return NewExitValue(CodePartialError, "")
+			}
 		}
 	}
-	return skipCount, err
+	return err
 }
 
 // pullSchemaDir updates all logical schemas in dir to reflect the actual
 // definitions found in instance. A slice of handled schema names is returned,
 // along with any error encountered.
 func pullSchemaDir(dir *fs.Dir, instance *tengo.Instance) (schemaNames []string, err error) {
-	for _, logicalSchema := range dir.LogicalSchemas {
-		names, err := pullLogicalSchema(dir, instance, logicalSchema)
-		if err != nil {
-			return nil, err
+	if dir.ParseError != nil {
+		log.Warnf("Skipping %s: %s", dir, dir.ParseError)
+		return nil, NewExitValue(CodePartialError, "")
+	}
+	if len(dir.LogicalSchemas) > 0 {
+		// TODO: support multiple logical schemas per dir
+		logicalSchema := dir.LogicalSchemas[0]
+		schemaNames, err = pullLogicalSchema(dir, instance, logicalSchema)
+	}
+	if err != nil {
+		log.Warnf("Skipping %s: %s\n", dir, err)
+		if _, ok := err.(*ExitValue); !ok {
+			err = NewExitValue(CodePartialError, "")
 		}
-		schemaNames = append(schemaNames, names...)
 	}
 	return
 }
@@ -147,17 +154,12 @@ func pullSchemaDir(dir *fs.Dir, instance *tengo.Instance) (schemaNames []string,
 // error encountered.
 func pullLogicalSchema(dir *fs.Dir, instance *tengo.Instance, logicalSchema *fs.LogicalSchema) (schemaNames []string, err error) {
 	if logicalSchema.Name != "" {
-		// TODO: support pull for case where multiple explicitly-named schemas per
-		// dir. For example, ability to convert a multi-schema single-file mysqldump
-		// into Skeema's usual multi-dir layout.
-		log.Warnf("Ignoring schema %s from directory %s -- multiple schemas per dir not supported yet", logicalSchema.Name, dir)
-		return []string{logicalSchema.Name}, nil
-	}
-	if schemaNames, err = dir.SchemaNames(instance); err != nil {
-		return nil, fmt.Errorf("%s: Unable to fetch schema names mapped by this dir: %s", dir, err)
+		schemaNames = []string{logicalSchema.Name}
+	} else if schemaNames, err = dir.SchemaNames(instance); err != nil {
+		return nil, fmt.Errorf("unable to fetch schema names mapped by this dir: %s", err)
 	}
 	if len(schemaNames) == 0 {
-		log.Warnf("Ignoring directory %s -- did not map to any schema names for environment \"%s\"\n", dir, dir.Config.Get("environment"))
+		log.Warnf("Ignoring directory %s -- did not map to any schema names for environment %q\n", dir, dir.Config.Get("environment"))
 		return
 	}
 	instSchema, err := instance.Schema(schemaNames[0])
@@ -165,20 +167,15 @@ func pullLogicalSchema(dir *fs.Dir, instance *tengo.Instance, logicalSchema *fs.
 		log.Infof("Deleted directory %s -- schema %s no longer exists\n", dir, schemaNames[0])
 		return nil, dir.Delete()
 	} else if err != nil {
-		return nil, fmt.Errorf("%s: Unable to fetch schema %s from %s: %s", dir, schemaNames[0], instance, err)
+		return nil, fmt.Errorf("Unable to fetch schema %s from %s: %s", schemaNames[0], instance, err)
 	}
 
 	log.Infof("Updating %s to reflect %s %s", dir, instance, instSchema.Name)
 
 	// Handle changes in schema's default character set and/or collation by
 	// persisting changes to the dir's option file.
-	if dir.Config.Get("default-character-set") != instSchema.CharSet || dir.Config.Get("default-collation") != instSchema.Collation {
-		dir.OptionFile.SetOptionValue("", "default-character-set", instSchema.CharSet)
-		dir.OptionFile.SetOptionValue("", "default-collation", instSchema.Collation)
-		if err := dir.OptionFile.Write(true); err != nil {
-			return nil, fmt.Errorf("Unable to update character set and collation for %s: %s", dir.OptionFile.Path(), err)
-		}
-		log.Infof("Wrote %s -- updated schema-level default-character-set and default-collation", dir.OptionFile.Path())
+	if err := updateCharSetCollation(dir, instSchema); err != nil {
+		return nil, err
 	}
 
 	dumpOpts := dumper.Options{
@@ -187,8 +184,15 @@ func pullLogicalSchema(dir *fs.Dir, instance *tengo.Instance, logicalSchema *fs.
 	if dumpOpts.IgnoreTable, err = dir.Config.GetRegexp("ignore-table"); err != nil {
 		return nil, NewExitValue(CodeBadConfig, err.Error())
 	}
-	if partitioning, _ := dir.Config.GetEnum("partitioning", "keep", "remove", "modify"); partitioning == "remove" {
-		dumpOpts.RetainPartitioning = true
+	if !dir.Config.GetBool("update-partitioning") {
+		if dir.Config.GetBool("strip-partitioning") {
+			// Undocumented due to potential confusion, but supported just like in init
+			dumpOpts.Partitioning = tengo.PartitioningRemove
+		} else {
+			// Without --update-partitioning, retain whatever partitioning clause (or
+			// lack of clause) was already present in the *.sql files for existing tables.
+			dumpOpts.Partitioning = tengo.PartitioningKeep
+		}
 	}
 
 	// When --skip-format is in use, we only want to update objects that have
@@ -209,7 +213,9 @@ func pullLogicalSchema(dir *fs.Dir, instance *tengo.Instance, logicalSchema *fs.
 	}
 
 	_, err = dumper.DumpSchema(instSchema, dir, dumpOpts)
-	os.Stderr.WriteString("\n")
+	if err == nil {
+		os.Stderr.WriteString("\n")
+	}
 	return
 }
 
@@ -233,10 +239,11 @@ func statementModifiersForPull(config *mybase.Config, instance *tengo.Instance, 
 	} else {
 		mods.Flavor = instFlavor
 	}
-	// If pulling from an environment that uses partitioning=remove, apply a
-	// statement modifier to make tengo.RemovePartitioning.Clause return an empty
-	// string. Otherwise, every partitioned-in-fs will show up as having a diff!
-	if partitioning, _ := config.GetEnum("partitioning", "keep", "remove", "modify"); partitioning == "remove" {
+	// Unless user specifically wants to update partitioning clauses, apply a
+	// statement modifier to make some partitioning-related AlterClause types
+	// return an empty statement, to exclude them from being rewritten if their
+	// only differences are partitioning-related.
+	if !config.GetBool("update-partitioning") {
 		mods.Partitioning = tengo.PartitioningKeep
 	}
 	return mods
@@ -295,6 +302,32 @@ func updateFlavor(dir *fs.Dir, instance *tengo.Instance) {
 	} else {
 		log.Infof("Wrote %s -- updated flavor to %s", dir.OptionFile.Path(), instFlavor.Family().String())
 	}
+}
+
+func updateGenerator(dir *fs.Dir) {
+	currentGenerator := generatorString() // see cmd_init.go
+	if dir.Config.Get("generator") == currentGenerator {
+		return
+	}
+	dir.OptionFile.SetOptionValue("", "generator", currentGenerator)
+	// ignoring errors; failure not terribly important
+	if err := dir.OptionFile.Write(true); err == nil {
+		log.Infof("Wrote %s -- updated generator to %s", dir.OptionFile.Path(), currentGenerator)
+	}
+}
+
+// updateCharSetCollation updates the dir's .skeema option file if the schema's
+// current default charset or collation does not match what's in the file.
+func updateCharSetCollation(dir *fs.Dir, instSchema *tengo.Schema) error {
+	if dir.Config.Get("default-character-set") != instSchema.CharSet || dir.Config.Get("default-collation") != instSchema.Collation {
+		dir.OptionFile.SetOptionValue("", "default-character-set", instSchema.CharSet)
+		dir.OptionFile.SetOptionValue("", "default-collation", instSchema.Collation)
+		if err := dir.OptionFile.Write(true); err != nil {
+			return fmt.Errorf("Unable to update character set and collation for %s: %s", dir.OptionFile.Path(), err)
+		}
+		log.Infof("Wrote %s -- updated schema-level default-character-set and default-collation", dir.OptionFile.Path())
+	}
+	return nil
 }
 
 func findNewSchemas(dir *fs.Dir, instance *tengo.Instance, seenNames []string) error {

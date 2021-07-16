@@ -1,20 +1,20 @@
 module github.com/skeema/skeema
 
-go 1.12
+go 1.14
 
 require (
-	github.com/VividCortex/mysqlerr v0.0.0-20170204212430-6c6b55f8796f
+	github.com/VividCortex/mysqlerr v0.0.0-20201215173831-4c396ae82aac
 	github.com/alecthomas/participle v0.3.0
-	github.com/jmoiron/sqlx v1.2.0
-	github.com/mattn/goveralls v0.0.3-0.20190605103025-4d9899298d21
+	github.com/jmoiron/sqlx v1.3.3
+	github.com/mattn/goveralls v0.0.8
 	github.com/mitchellh/go-wordwrap v1.0.0
 	github.com/nozzle/throttler v0.0.0-20180817012639-2ea982251481
 	github.com/opencontainers/runc v1.0.0-rc5 // indirect
-	github.com/sirupsen/logrus v1.4.2
-	github.com/skeema/mybase v1.0.8
-	github.com/skeema/tengo v0.9.2
-	golang.org/x/crypto v0.0.0-20190701094942-4def268fd1a4
-	golang.org/x/lint v0.0.0-20190409202823-959b441ac422
-	golang.org/x/sync v0.0.0-20190423024810-112230192c58
-	golang.org/x/tools v0.0.0-20190903163617-be0da057c5e3 // indirect
+	github.com/sirupsen/logrus v1.8.1
+	github.com/skeema/mybase v1.0.13
+	github.com/skeema/tengo v0.10.2-0.20210715223439-7d20c8c9a685
+	golang.org/x/lint v0.0.0-20201208152925-83fdc39ff7b5
+	golang.org/x/sync v0.0.0-20201207232520-09787c993a3a
+	golang.org/x/sys v0.0.0-20210415045647-66c3f260301c // indirect
+	golang.org/x/term v0.0.0-20201210144234-2321bbc49cbf
 )

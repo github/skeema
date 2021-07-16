@@ -1,57 +1,40 @@
 [![Skeema](https://www.skeema.io/img/logo.png)](https://www.skeema.io)
 
-[![build status](https://img.shields.io/travis/skeema/skeema/master.svg)](https://travis-ci.org/skeema/skeema)
+[![build status](https://img.shields.io/github/workflow/status/skeema/skeema/Tests/main)](https://github.com/skeema/skeema/actions)
 [![code coverage](https://img.shields.io/coveralls/skeema/skeema.svg)](https://coveralls.io/r/skeema/skeema)
 [![downloads](https://img.shields.io/github/downloads/skeema/skeema/total.svg)](https://github.com/skeema/skeema/releases)
 [![latest release](https://img.shields.io/github/release/skeema/skeema.svg)](https://github.com/skeema/skeema/releases)
 
-Skeema is a tool for managing MySQL tables and schema changes in a declarative fashion using pure SQL. It provides a CLI tool allowing you to:
+Skeema is a tool for managing MySQL and MariaDB schema changes in a declarative fashion using pure SQL. The Skeema CLI tool allows you to:
 
 * Export CREATE TABLE statements to the filesystem, for tracking in a repo (git, hg, svn, etc)
 * Diff changes in the schema repo against live DBs to automatically generate DDL
 * Manage multiple environments (e.g. dev, staging, prod) and keep them in sync with ease
 * Configure use of online schema change tools, such as pt-online-schema-change, for performing ALTERs
-* Convert non-online migrations from frameworks like Rails or Django into online schema changes in production
+* Apply configurable linter rules to proactively catch schema design problems and enforce company policies
 
-Skeema supports a pull-request-based workflow for schema change submission, review, and execution. This permits your team to manage schema changes in exactly the same way as you manage code changes. Our new companion [CI app for GitHub repos](https://github.com/apps/skeema-io) even provides automatic linting of schema change pull requests.
+Skeema supports a pull-request-based workflow for schema change submission, review, and execution. This permits your team to manage schema changes in exactly the same way as you manage code changes.
 
-## Downloading
+## Products and downloads
 
-Pre-built `skeema` binaries for Linux and macOS can be downloaded from the [releases](https://github.com/skeema/skeema/releases) page.
+This repo is the free open source Community edition of the Skeema CLI. The Community edition supports management of **tables** and **routines** (procs/funcs). Builds are provided for Linux and MacOS.
 
-## Compiling
+The paid [Premium edition](https://www.skeema.io/download/) of the Skeema CLI adds support for managing **views** and **triggers**, and also includes a native Windows build, among other improvements.
 
-Compiling from scratch requires the [Go programming language toolchain](https://golang.org/dl/), version 1.12 or higher.
+A companion SaaS product, [Skeema Cloud Linter](https://www.skeema.io/docs/install/cloud/), is also available to simplify CI setup for schema repos stored on GitHub.
 
-To download, build from master, and install (or upgrade) Skeema, run:
-
-`go get -u github.com/skeema/skeema`
+For download links and more information, visit [skeema.io](https://www.skeema.io/download/).
 
 ## Documentation
 
-* [Getting started](doc/examples.md): usage examples and screencasts
-* [Recommended workflow](doc/workflow.md)
-* [Configuration how-to](doc/config.md)
-* [Options reference](doc/options.md)
-* [Requirements](doc/requirements.md)
-* [Frequently asked questions](doc/faq.md)
-* [Skeema.io CI beta](https://www.skeema.io/ci) -- **new**
-
-## Status
-
-The Skeema CLI tool is generally available, having reached the v1 release milestone in July 2018. Prior to that, it was in public beta since October 2016.
-
-The `skeema` binary is supported on macOS and Linux. No native Windows version is available yet, though the Linux binary works properly under WSL.
-
-Tagged releases are tested against the following databases, all running on Linux:
-
-* MySQL 5.5, 5.6, 5.7, 8.0
-* Percona Server 5.5, 5.6, 5.7, 8.0
-* MariaDB 10.1, 10.2, 10.3, 10.4
-
-Outside of a tagged release, every commit to the master branch is automatically tested against MySQL 5.6 and 5.7.
-
-A few uncommon MySQL features -- such as spatial indexes and subpartitioning -- are not supported yet. Skeema is able to *create* or *drop* tables using these features, but not *alter* them. The output of `skeema diff` and `skeema push` clearly displays when this is the case. You may still make such alters directly/manually (outside of Skeema), and then update the corresponding CREATE TABLE files via `skeema pull`.
+* [Installation](https://www.skeema.io/docs/install/)
+* [Getting started](https://www.skeema.io/docs/examples/): usage examples and screencasts
+* [Requirements](https://www.skeema.io/docs/requirements/): supported database versions, required privileges, supported DB features, and edge cases
+* [Recommended workflow](https://www.skeema.io/docs/workflow/): recommended flow from development to production deployments
+* [Configuration guide](https://www.skeema.io/docs/config/): option handling, config file format, and command-line option usage
+* [Command reference](https://www.skeema.io/docs/commands/): usage instructions for each command in the Skeema CLI
+* [Options reference](https://www.skeema.io/docs/options/): detailed information on every Skeema option
+* [Frequently asked questions](https://www.skeema.io/docs/faq/)
 
 ## Credits
 
@@ -64,7 +47,9 @@ Additional [contributions](https://github.com/skeema/skeema/graphs/contributors)
 * [@chrisjpalmer](https://github.com/chrisjpalmer)
 * [@johlo](https://github.com/johlo)
 * [@blueish](https://github.com/blueish)
-* [@thinQ-skeema](https://github.com/thinQ-skeema)
+* [@alexandre-vaniachine](https://github.com/alexandre-vaniachine)
+* [@estahn](https://github.com/estahn)
+* [@tonyqiu2020](https://github.com/tonyqiu2020)
 
 Support for stored procedures and functions generously sponsored by [Psyonix](https://psyonix.com).
 
@@ -72,7 +57,7 @@ Support for partitioned tables generously sponsored by [Etsy](https://www.etsy.c
 
 ## License
 
-**Copyright 2020 Skeema LLC**
+**Copyright 2021 Skeema LLC**
 
 ```text
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -87,5 +72,3 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ```
-
-

@@ -5,33 +5,32 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/skeema/mybase"
-	"github.com/skeema/skeema/dumper"
-	"github.com/skeema/skeema/fs"
-	"github.com/skeema/skeema/workspace"
+	"github.com/skeema/skeema/internal/dumper"
+	"github.com/skeema/skeema/internal/fs"
+	"github.com/skeema/skeema/internal/workspace"
 	"github.com/skeema/tengo"
 )
 
 func init() {
 	summary := "Normalize format of filesystem representation of database objects"
-	desc := `Reformats the filesystem representation of database objects to match the canonical
-format shown in SHOW CREATE.
-
-This command relies on accessing database instances to test the SQL DDL in a
-temporary location. See the workspace option for more information.
-
-You may optionally pass an environment name as a CLI option. This will affect
-which section of .skeema config files is used for workspace selection. For
-example, running ` + "`" + `skeema format staging` + "`" + ` will
-apply config directives from the [staging] section of config files, as well as
-any sectionless directives at the top of the file. If no environment name is
-supplied, the default is "production".
-
-An exit code of 0 will be returned if all files were already formatted properly;
-1 if some files were not already in the correct format; or 2+ if any errors
-occurred.`
+	desc := "Reformats the filesystem representation of database objects to match the canonical " +
+		"format shown in SHOW CREATE.\n\n" +
+		"This command relies on accessing database instances to test the SQL DDL in a " +
+		"temporary location. See the --workspace option for more information.\n\n" +
+		"You may optionally pass an environment name as a CLI arg. This will affect " +
+		"which section of .skeema config files is used for workspace selection. For " +
+		"example, running `skeema format staging` will " +
+		"apply config directives from the [staging] section of config files, as well as " +
+		"any sectionless directives at the top of the file. If no environment name is " +
+		"supplied, the default is \"production\".\n\n" +
+		"An exit code of 0 will be returned if all files were already formatted properly; " +
+		"1 if some files were not already in the correct format; or 2+ if any errors " +
+		"occurred."
 
 	cmd := mybase.NewCommand("format", summary, desc, FormatHandler)
 	cmd.AddOption(mybase.BoolOption("write", 0, true, "Update files to correct format"))
+	cmd.AddOption(mybase.BoolOption("strip-partitioning", 0, false, "Remove PARTITION BY clauses from *.sql files"))
+	workspace.AddCommandOptions(cmd)
 	cmd.AddArg("environment", "production", false)
 	CommandSuite.AddSubCommand(cmd)
 }
@@ -79,9 +78,7 @@ func formatWalker(dir *fs.Dir, maxDepth int) error {
 	}
 	for _, sub := range subdirs {
 		err := formatWalker(sub, maxDepth-1)
-		if ExitCode(err) > ExitCode(result) {
-			result = err
-		}
+		result = HighestExitCode(result, err)
 	}
 	return result
 }
@@ -89,6 +86,8 @@ func formatWalker(dir *fs.Dir, maxDepth int) error {
 // formatDir reformats SQL statements in all logical schemas in dir. This
 // function does not recurse into subdirs.
 func formatDir(dir *fs.Dir) error {
+	var totalReformatCount int
+
 	ignoreTable, err := dir.Config.GetRegexp("ignore-table")
 	if err != nil {
 		return NewExitValue(CodeBadConfig, err.Error())
@@ -102,15 +101,16 @@ func formatDir(dir *fs.Dir) error {
 		if wsType, _ := dir.Config.GetEnum("workspace", "temp-schema", "docker"); wsType != "docker" || !dir.Config.Changed("flavor") {
 			if inst, err = dir.FirstInstance(); err != nil {
 				return NewExitValue(CodeBadConfig, err.Error())
+			} else if inst == nil {
+				return NewExitValue(CodeBadConfig, "No host defined for environment %q", dir.Config.Get("environment"))
 			}
 		}
 		if wsOpts, err = workspace.OptionsForDir(dir, inst); err != nil {
 			return NewExitValue(CodeBadConfig, err.Error())
 		}
-	}
 
-	var totalReformatCount int
-	for _, logicalSchema := range dir.LogicalSchemas {
+		// TODO: support multiple logical schemas per dir
+		logicalSchema := dir.LogicalSchemas[0]
 		wsSchema, err := workspace.ExecLogicalSchema(logicalSchema, wsOpts)
 		if err != nil {
 			return err
@@ -126,6 +126,9 @@ func formatDir(dir *fs.Dir) error {
 			IgnoreTable:    ignoreTable,
 			CountOnly:      !dir.Config.GetBool("write"),
 		}
+		if dir.Config.GetBool("strip-partitioning") {
+			dumpOpts.Partitioning = tengo.PartitioningRemove
+		}
 		dumpOpts.IgnoreKeys(wsSchema.FailedKeys())
 		reformatCount, err := dumper.DumpSchema(wsSchema.Schema, dir, dumpOpts)
 		if err != nil {
@@ -133,6 +136,7 @@ func formatDir(dir *fs.Dir) error {
 		}
 		totalReformatCount += reformatCount
 	}
+
 	for _, stmt := range dir.IgnoredStatements {
 		log.Debugf("%s: unable to parse statement", stmt.Location())
 	}

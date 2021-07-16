@@ -8,12 +8,13 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/skeema/mybase"
-	"github.com/skeema/skeema/fs"
-	"github.com/skeema/skeema/util"
+	"github.com/skeema/skeema/internal/fs"
+	"github.com/skeema/skeema/internal/util"
 	"github.com/skeema/tengo"
 )
 
@@ -75,6 +76,7 @@ func (s *SkeemaIntegrationSuite) Teardown(backend string) error {
 	if err := os.RemoveAll(s.scratchPath()); err != nil {
 		return err
 	}
+	util.FlushInstanceCache()
 	return nil
 }
 
@@ -89,6 +91,9 @@ func (s *SkeemaIntegrationSuite) BeforeTest(backend string) error {
 
 	// Create or recreate scratch dir
 	if _, err := os.Stat(s.scratchPath()); err == nil { // dir exists
+		if err := os.Chdir(s.repoPath); err != nil {
+			return err
+		}
 		if err := os.RemoveAll(s.scratchPath()); err != nil {
 			return err
 		}
@@ -130,7 +135,12 @@ func (s *SkeemaIntegrationSuite) handleCommand(t *testing.T, expectedExitCode in
 	}
 
 	fullCommandLine := fmt.Sprintf(commandLine, a...)
-	fmt.Fprintf(os.Stderr, "\x1b[37;1m%s$\x1b[0m %s\n", filepath.Join("testdata", ".scratch", pwd), fullCommandLine)
+	if runtime.GOOS == "windows" {
+		// Omit ANSI color codes on Windows
+		fmt.Fprintf(os.Stderr, "%s$ %s\n", filepath.Join("testdata", ".scratch", pwd), fullCommandLine)
+	} else {
+		fmt.Fprintf(os.Stderr, "\x1b[37;1m%s$\x1b[0m %s\n", filepath.Join("testdata", ".scratch", pwd), fullCommandLine)
+	}
 	fakeFileSource := mybase.SimpleSource(map[string]string{"password": s.d.Instance.Password})
 	cfg := mybase.ParseFakeCLI(t, CommandSuite, fullCommandLine, fakeFileSource)
 	util.AddGlobalConfigFiles(cfg)
@@ -217,9 +227,9 @@ func (s *SkeemaIntegrationSuite) compareDirs(t *testing.T, a, b *fs.Dir) {
 		t.Fatalf("Dir parse error: %v", b.ParseError)
 	}
 
-	compareDirOptionFiles(t, a, b, s.d.Flavor())
-	compareDirSQLFiles(t, a, b)
-	compareDirLogicalSchemas(t, a, b, s.d.Flavor())
+	s.compareDirOptionFiles(t, a, b)
+	s.compareDirSQLFiles(t, a, b)
+	s.compareDirLogicalSchemas(t, a, b)
 
 	// Compare subdirs and walk them
 	aSubdirs, err := a.Subdirs()
@@ -248,7 +258,7 @@ func (s *SkeemaIntegrationSuite) compareDirs(t *testing.T, a, b *fs.Dir) {
 // option file to look like b; this is to avoid false positives in fields that
 // we expect to differ based solely on the test environment itself (such as the
 // random port number of the Docker container).
-func compareDirOptionFiles(t *testing.T, a, b *fs.Dir, flavor tengo.Flavor) {
+func (s *SkeemaIntegrationSuite) compareDirOptionFiles(t *testing.T, a, b *fs.Dir) {
 	t.Helper()
 	if (a.OptionFile == nil && b.OptionFile != nil) || (a.OptionFile != nil && b.OptionFile == nil) {
 		t.Errorf("Presence of option files does not match between %s and %s", a, b)
@@ -269,7 +279,26 @@ func compareDirOptionFiles(t *testing.T, a, b *fs.Dir, flavor tengo.Flavor) {
 		}
 		// Force flavor of a to match the DockerizedInstance's flavor
 		for _, section := range a.OptionFile.SectionsWithOption("flavor") {
-			a.OptionFile.SetOptionValue(section, "flavor", flavor.Family().String())
+			a.OptionFile.SetOptionValue(section, "flavor", s.d.Flavor().Family().String())
+		}
+		// If b sets a generator, force generator of a to be correct value for current
+		// version/edition
+		for _, section := range b.OptionFile.SectionsWithOption("generator") {
+			a.OptionFile.SetOptionValue(section, "generator", generatorString())
+		}
+		// Force charset/collation to match the DockerizedInstance's defaults, where requested
+		if sectionsWithSchema := a.OptionFile.SectionsWithOption("schema"); len(sectionsWithSchema) > 0 {
+			instDefCharSet, instDefCollation, err := s.d.DefaultCharSetAndCollation()
+			if err != nil {
+				t.Fatalf("Unexpected error querying Dockerized instance's default charset/collation: %v", err)
+			}
+			for _, section := range sectionsWithSchema {
+				a.OptionFile.UseSection(section)
+				if fileCharSet, ok := a.OptionFile.OptionValue("default-character-set"); ok && fileCharSet[0] == '{' {
+					a.OptionFile.SetOptionValue(section, "default-character-set", instDefCharSet)
+					a.OptionFile.SetOptionValue(section, "default-collation", instDefCollation)
+				}
+			}
 		}
 
 		if !a.OptionFile.SameContents(b.OptionFile) {
@@ -283,7 +312,7 @@ func compareDirOptionFiles(t *testing.T, a, b *fs.Dir, flavor tengo.Flavor) {
 // compareDirSQLFiles compares the existence of *.sql files between dirs a and
 // b. Does not compare the actual file contents, which is instead handled by
 // compareDirLogicalSchemas.
-func compareDirSQLFiles(t *testing.T, a, b *fs.Dir) {
+func (s *SkeemaIntegrationSuite) compareDirSQLFiles(t *testing.T, a, b *fs.Dir) {
 	t.Helper()
 	if len(a.SQLFiles) != len(b.SQLFiles) {
 		t.Errorf("Differing count of *.sql files between %s and %s", a, b)
@@ -302,7 +331,7 @@ var reDisplayWidth = regexp.MustCompile(`(tinyint|smallint|mediumint|int|bigint)
 // should be the expected (golden) dir, and b the dir generated from the logic
 // being tested. Some flavor-specific adjustments are automatically made to the
 // statements in a.
-func compareDirLogicalSchemas(t *testing.T, a, b *fs.Dir, flavor tengo.Flavor) {
+func (s *SkeemaIntegrationSuite) compareDirLogicalSchemas(t *testing.T, a, b *fs.Dir) {
 	t.Helper()
 	if len(a.LogicalSchemas) != len(b.LogicalSchemas) {
 		t.Errorf("Mismatch between count of parsed logical schemas: %s=%d vs %s=%d", a, len(a.LogicalSchemas), b, len(b.LogicalSchemas))
@@ -311,9 +340,11 @@ func compareDirLogicalSchemas(t *testing.T, a, b *fs.Dir, flavor tengo.Flavor) {
 		if len(aCreates) != len(bCreates) {
 			t.Errorf("Mismatch in CREATE count: %s=%d, %s=%d", a, len(aCreates), b, len(bCreates))
 		} else {
+			flavor := s.d.Flavor()
 			for key, aStmt := range aCreates {
 				bStmt := bCreates[key]
-				aText, bText := aStmt.Text, bStmt.Text
+				aText := strings.ReplaceAll(aStmt.Text, "\r\n", "\n")
+				bText := strings.ReplaceAll(bStmt.Text, "\r\n", "\n")
 				if flavor.OmitIntDisplayWidth() {
 					aText = reDisplayWidth.ReplaceAllString(aText, "$1$3$4")
 				}
@@ -425,7 +456,7 @@ func (s *SkeemaIntegrationSuite) dbExec(t *testing.T, schemaName, query string, 
 // it is fatal to the current test.
 func (s *SkeemaIntegrationSuite) dbExecWithParams(t *testing.T, schemaName, params, query string, args ...interface{}) {
 	t.Helper()
-	db, err := s.d.Connect(schemaName, params)
+	db, err := s.d.CachedConnectionPool(schemaName, params)
 	if err != nil {
 		t.Fatalf("Unable to connect to DockerizedInstance: %s", err)
 	}

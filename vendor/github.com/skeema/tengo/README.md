@@ -1,6 +1,6 @@
 # Go La Tengo
 
-[![build status](https://img.shields.io/travis/skeema/tengo/master.svg)](http://travis-ci.org/skeema/tengo)
+[![build status](https://img.shields.io/github/workflow/status/skeema/tengo/Tests/main)](https://github.com/skeema/tengo/actions)
 [![code coverage](https://img.shields.io/coveralls/skeema/tengo.svg)](https://coveralls.io/r/skeema/tengo)
 [![godoc](https://img.shields.io/badge/godoc-reference-blue.svg)](https://godoc.org/github.com/skeema/tengo)
 [![latest release](https://img.shields.io/github/release/skeema/tengo.svg)](https://github.com/skeema/tengo/releases)
@@ -29,9 +29,9 @@ Tagged releases are tested against the following databases, all running on Linux
 
 * MySQL 5.5, 5.6, 5.7, 8.0
 * Percona Server 5.5, 5.6, 5.7, 8.0
-* MariaDB 10.1, 10.2, 10.3, 10.4
+* MariaDB 10.1, 10.2, 10.3, 10.4, 10.5
 
-Outside of a tagged release, every commit to the master branch is automatically tested against MySQL 5.6 and 5.7.
+Outside of a tagged release, every commit to the main branch is automatically tested against MySQL 5.7 and 8.0.
 
 ### Unsupported in table diffs
 
@@ -39,7 +39,6 @@ Go La Tengo **cannot** diff tables containing any of the following MySQL feature
 
 * spatial indexes
 * sub-partitioning (two levels of partitioning in the same table)
-* CHECK constraints (MySQL 8.0.16+ / Percona Server 8.0.16+ / MariaDB 10.2+)
 * special features of non-InnoDB storage engines
 
 This list is not necessarily exhaustive. Some of these may be implemented in subsequent releases.
@@ -57,12 +56,13 @@ The following object types are completely ignored by this package. Their presenc
 
 ## External Dependencies
 
-* http://github.com/go-sql-driver/mysql (Mozilla Public License 2.0)
-* http://github.com/jmoiron/sqlx (MIT License)
-* http://github.com/VividCortex/mysqlerr (MIT License)
-* http://github.com/fsouza/go-dockerclient (BSD License)
-* http://github.com/pmezard/go-difflib/difflib (BSD License)
-* http://github.com/nozzle/throttler (Apache License 2.0)
+* https://github.com/go-sql-driver/mysql (Mozilla Public License 2.0)
+* https://github.com/jmoiron/sqlx (MIT License)
+* https://github.com/VividCortex/mysqlerr (MIT License)
+* https://github.com/fsouza/go-dockerclient (BSD License)
+* https://github.com/pmezard/go-difflib/difflib (BSD License)
+* https://github.com/nozzle/throttler (Apache License 2.0)
+* https://golang.org/x/sync/errgroup (BSD License)
 
 ## Credits
 
@@ -73,7 +73,8 @@ Additional [contributions](https://github.com/skeema/tengo/graphs/contributors) 
 * [@tomkrouper](https://github.com/tomkrouper)
 * [@efixler](https://github.com/efixler)
 * [@chrisjpalmer](https://github.com/chrisjpalmer)
-* [@thinQ-skeema](https://github.com/thinQ-skeema)
+* [@alexandre-vaniachine](https://github.com/alexandre-vaniachine)
+* [@mhemmings](https://github.com/mhemmings)
 
 Support for stored procedures and functions generously sponsored by [Psyonix](https://psyonix.com).
 
@@ -81,7 +82,7 @@ Support for partitioned tables generously sponsored by [Etsy](https://www.etsy.c
 
 ## License
 
-**Copyright 2020 Skeema LLC**
+**Copyright 2021 Skeema LLC**
 
 ```text
 Licensed under the Apache License, Version 2.0 (the "License");

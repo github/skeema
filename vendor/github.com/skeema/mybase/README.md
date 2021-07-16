@@ -1,6 +1,6 @@
 # mybase
 
-[![build status](https://img.shields.io/travis/skeema/mybase/master.svg)](http://travis-ci.org/skeema/mybase)
+[![build status](https://img.shields.io/github/workflow/status/skeema/mybase/Tests/main)](https://github.com/skeema/mybase/actions)
 [![godoc](https://img.shields.io/badge/godoc-reference-blue.svg)](https://godoc.org/github.com/skeema/mybase)
 [![latest release](https://img.shields.io/github/release/skeema/mybase.svg)](https://github.com/skeema/mybase/releases)
 
@@ -47,7 +47,7 @@ The following features are **not** yet implemented, but are planned for future r
 * API for re-reading all option files that have changed
 * Command aliases
 
-Unit test coverage of mybase is still incomplete; code coverage is currently around 55%. This will be improved in future releases.
+Unit test coverage of mybase is still incomplete; code coverage is currently around 68%. This will be improved in future releases.
 
 ## Credits
 
@@ -56,10 +56,11 @@ Created and maintained by [@evanelias](https://github.com/evanelias).
 Additional [contributions](https://github.com/skeema/mybase/graphs/contributors) by:
 
 * [@zls0424](https://github.com/zls0424)
+* [@gusgins](https://github.com/gusgins)
 
 ## License
 
-**Copyright 2019 Skeema LLC**
+**Copyright 2021 Skeema LLC**
 
 ```text
 Licensed under the Apache License, Version 2.0 (the "License");

@@ -3,11 +3,12 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/skeema/mybase"
-	"github.com/skeema/skeema/fs"
+	"github.com/skeema/skeema/internal/fs"
 	"github.com/skeema/tengo"
 )
 
@@ -20,8 +21,9 @@ func (s SkeemaIntegrationSuite) TestInitHandler(t *testing.T) {
 	// Specifying a single schema that doesn't exist on the instance
 	s.handleCommand(t, CodeBadConfig, ".", "skeema init --dir mydb -h %s -P %d --schema doesntexist", s.d.Instance.Host, s.d.Instance.Port)
 
-	// Specifying a single schema that is a system schema
+	// Specifying a single schema that is a system schema, regardless of case
 	s.handleCommand(t, CodeBadConfig, ".", "skeema init --dir mydb -h %s -P %d --schema mysql", s.d.Instance.Host, s.d.Instance.Port)
+	s.handleCommand(t, CodeBadConfig, ".", "skeema init --dir mydb -h %s -P %d --schema InFoRMaTiOn_ScHeMa", s.d.Instance.Host, s.d.Instance.Port)
 
 	// Successful standard execution. Also confirm user is not persisted to .skeema
 	// since not specified on CLI.
@@ -35,7 +37,7 @@ func (s SkeemaIntegrationSuite) TestInitHandler(t *testing.T) {
 	s.handleCommand(t, CodeFatalError, ".", "skeema init --dir baddb -h %s -P %d", s.d.Instance.Host, s.d.Instance.Port-100)
 
 	// host-wrapper with no output should fail
-	s.handleCommand(t, CodeBadConfig, ".", "skeema init --dir baddb -h xyz --host-wrapper='echo'")
+	s.handleCommand(t, CodeBadConfig, ".", "skeema init --dir baddb -h xyz --host-wrapper='echo \" \"'")
 
 	// Test successful init with --user specified on CLI, persisting to .skeema
 	cfg = s.handleCommand(t, CodeSuccess, ".", "skeema init --dir withuser -h %s -P %d --user root", s.d.Instance.Host, s.d.Instance.Port)
@@ -75,7 +77,7 @@ func (s SkeemaIntegrationSuite) TestInitHandler(t *testing.T) {
 	}
 
 	// Test successful init without a --dir. Also test persistence of --connect-options.
-	expectDir := fmt.Sprintf("%s:%d", s.d.Instance.Host, s.d.Instance.Port)
+	expectDir := fs.HostDefaultDirName(s.d.Instance.Host, s.d.Instance.Port)
 	if _, err = os.Stat(expectDir); err == nil {
 		t.Fatalf("Expected dir %s to not exist yet, but it does", expectDir)
 	}
@@ -85,17 +87,6 @@ func (s SkeemaIntegrationSuite) TestInitHandler(t *testing.T) {
 	}
 	mybase.AssertFileSetsOptions(t, dir.OptionFile, "host", "port", "connect-options")
 	mybase.AssertFileMissingOptions(t, dir.OptionFile, "schema", "default-character-set", "default-collation")
-
-	// Test successful init on a schema that isn't strict-mode compliant
-	s.dbExecWithParams(t, "product", "sql_mode=%27NO_ENGINE_SUBSTITUTION%27", "ALTER TABLE posts MODIFY COLUMN created_at datetime NOT NULL DEFAULT '0000-00-00 00:00:00'")
-	cfg = s.handleCommand(t, CodeSuccess, ".", "skeema init -h %s -P %d --dir nonstrict", s.d.Instance.Host, s.d.Instance.Port)
-	if dir, err = fs.ParseDir("nonstrict", cfg); err != nil {
-		t.Fatalf("Unexpected error from ParseDir: %s", err)
-	}
-	value, _ := dir.OptionFile.OptionValue("connect-options")
-	if !strings.Contains(value, "innodb_strict_mode=0") {
-		t.Errorf("Expected non-strict-compliant schema to use relaxed connect-options; instead found connect-options=%s", value)
-	}
 
 	// init should fail if a parent dir has an invalid .skeema file
 	fs.MakeTestDirectory(t, "hasbadoptions")
@@ -210,7 +201,7 @@ func (s SkeemaIntegrationSuite) TestPullHandler(t *testing.T) {
 	// before/after the CREATE TABLE should remain as-is, regardless of whether
 	// there were other changes triggering a file rewrite. Files containing
 	// commands plus a table that doesn't exist should be deleted, instead of
-	// leaving a file with lingering commands.
+	// leaving a file with lingering commands. Generator string should be updated.
 	contents := fs.ReadTestFile(t, "mydb/analytics/activity.sql")
 	fs.WriteTestFile(t, "mydb/analytics/activity.sql", strings.Replace(contents, "DEFAULT", "DEFALUT", 1))
 	s.dbExec(t, "product", "INSERT INTO comments (post_id, user_id) VALUES (555, 777)")
@@ -219,6 +210,8 @@ func (s SkeemaIntegrationSuite) TestPullHandler(t *testing.T) {
 	contents = fs.ReadTestFile(t, "mydb/product/posts.sql")
 	fs.WriteTestFile(t, "mydb/product/posts.sql", fmt.Sprintf("# random comment\n%s", contents))
 	fs.WriteTestFile(t, "mydb/product/noexist.sql", "DELIMITER //\nCREATE TABLE noexist (id int)//\nDELIMITER ;\n")
+	contents = fs.ReadTestFile(t, "mydb/.skeema")
+	fs.WriteTestFile(t, "mydb/.skeema", strings.Replace(contents, generatorString(), "skeema:1.4.7-community", 1))
 	cfg = s.handleCommand(t, CodeSuccess, ".", "skeema pull --debug")
 	s.verifyFiles(t, cfg, "../golden/init")
 	contents = fs.ReadTestFile(t, "mydb/product/posts.sql")
@@ -249,6 +242,27 @@ func (s SkeemaIntegrationSuite) TestPullHandler(t *testing.T) {
 	s.handleCommand(t, CodePartialError, ".", "skeema pull")
 	if _, err := os.Stat("mydb/archives"); !os.IsNotExist(err) {
 		t.Errorf("Expected os.Stat to return IsNotExist error for mydb/archives; instead err=%v", err)
+	}
+
+	// Start over; Bad option file in a non-leaf dir should yield CodeBadConfig
+	// and no files should be updated
+	s.cleanData(t, "setup.sql")
+	s.reinitAndVerifyFiles(t, "", "")
+	origMydbConfig := fs.ReadTestFile(t, "mydb/.skeema")
+	fs.WriteTestFile(t, "mydb/.skeema", origMydbConfig+"\nbad config here")
+	contents = fs.ReadTestFile(t, "mydb/analytics/activity.sql")
+	fs.WriteTestFile(t, "mydb/analytics/activity.sql", strings.Replace(contents, "DEFAULT", "DEFALUT", 1))
+	s.handleCommand(t, CodeBadConfig, ".", "skeema pull")
+	if contents = fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(contents, "DEFALUT") {
+		t.Error("Unexpected behavior from pull with a non-leaf parse error")
+	}
+
+	// Ditto if non-leaf option file is valid but contains a problematic host list
+	// (but CodePartialError this time)
+	fs.WriteTestFile(t, "mydb/.skeema", origMydbConfig+"\nhost-wrapper=invalid-binary")
+	s.handleCommand(t, CodePartialError, ".", "skeema pull")
+	if contents = fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(contents, "DEFALUT") {
+		t.Error("Unexpected behavior from pull with a non-leaf parse error")
 	}
 
 	// Test pull behavior on a "flat" layout (single dir defining host and schema):
@@ -753,7 +767,7 @@ func (s SkeemaIntegrationSuite) TestUnsupportedAlter(t *testing.T) {
 
 	// apply change to db directly, and confirm pull still works
 	s.sourceSQL(t, "unsupported1.sql")
-	cfg := s.handleCommand(t, CodeSuccess, ".", "skeema pull --debug")
+	cfg := s.handleCommand(t, CodeSuccess, ".", "skeema pull --debug --update-partitioning")
 	s.verifyFiles(t, cfg, "../golden/unsupported")
 
 	// back to clean slate for db only
@@ -837,7 +851,7 @@ func (s SkeemaIntegrationSuite) TestIgnoreOptions(t *testing.T) {
 	s.handleCommand(t, CodeBadConfig, ".", "skeema lint --ignore-table='+'")
 	s.handleCommand(t, CodeBadConfig, ".", "skeema format --ignore-table='+'")
 	s.handleCommand(t, CodeBadConfig, ".", "skeema pull --ignore-table='+'")
-	s.handleCommand(t, CodeFatalError, ".", "skeema pull --ignore-schema='+'")
+	s.handleCommand(t, CodePartialError, ".", "skeema pull --ignore-schema='+'")
 	s.handleCommand(t, CodeBadConfig, ".", "skeema push --ignore-table='+'")
 	s.handleCommand(t, CodeFatalError, ".", "skeema push --ignore-schema='+'")
 	s.handleCommand(t, CodeBadConfig, ".", "skeema init --dir badre1 -h %s -P %d --ignore-schema='+'", s.d.Instance.Host, s.d.Instance.Port)
@@ -868,6 +882,13 @@ func (s SkeemaIntegrationSuite) TestDirEdgeCases(t *testing.T) {
 	s.handleCommand(t, CodeSuccess, ".", "skeema pull")
 	s.handleCommand(t, CodeSuccess, ".", "skeema diff")
 	s.handleCommand(t, CodeSuccess, ".", "skeema lint")
+
+	// Referencing an undefined environment should fail gracefully, without panic
+	// on a nil instance, despite presence of *.sql files
+	s.handleCommand(t, CodeBadConfig, ".", "skeema format undefinedenv")
+	s.handleCommand(t, CodeBadConfig, ".", "skeema lint undefinedenv")
+	s.handleCommand(t, CodeBadConfig, ".", "skeema pull undefinedenv")
+	s.handleCommand(t, CodeSuccess, ".", "skeema diff undefinedenv")
 
 	// Extra subdirs with .skeema files and *.sql files don't inherit "schema"
 	// option value from parent dir, and are ignored by diff/push/pull as long
@@ -912,14 +933,6 @@ func (s SkeemaIntegrationSuite) TestNonInnoClauses(t *testing.T) {
 		t.Skip("Test not relevant for 5.5-based image", s.d.Image)
 	}
 
-	// By default, Skeema uses innodb_strict_mode=1 in its connections. MySQL 5.6
-	// interprets that option to prevent use of KEY_BLOCK_SIZE in nonsensical ways,
-	// so we must disable it for this test.
-	var connectOpts string
-	if major, minor, _ := s.d.Version(); major == 5 && minor == 6 {
-		connectOpts = " --connect-options=\"innodb_strict_mode=0\""
-	}
-
 	withClauses := "CREATE TABLE `problems` (\n" +
 		"  `name` varchar(30) /*!50606 STORAGE MEMORY */ /*!50606 COLUMN_FORMAT DYNAMIC */ DEFAULT NULL,\n" +
 		"  `num` int(10) unsigned NOT NULL /*!50606 STORAGE DISK */ /*!50606 COLUMN_FORMAT FIXED */,\n" +
@@ -956,18 +969,18 @@ func (s SkeemaIntegrationSuite) TestNonInnoClauses(t *testing.T) {
 
 	// lint normalizes files to remove the clauses
 	fs.WriteTestFile(t, "mydb/product/problems.sql", withClauses)
-	s.handleCommand(t, CodeDifferencesFound, ".", "skeema lint%s --errors=''", connectOpts)
+	s.handleCommand(t, CodeDifferencesFound, ".", "skeema lint --errors=''")
 	assertFileNormalized()
 
 	// diff views the clauses as no-ops if present in file but not db, or vice versa
 	s.dbExec(t, "product", "DROP TABLE `problems`")
 	s.dbExec(t, "product", withoutClauses)
 	fs.WriteTestFile(t, "mydb/product/problems.sql", withClauses)
-	s.handleCommand(t, CodeSuccess, ".", "skeema diff%s", connectOpts)
+	s.handleCommand(t, CodeSuccess, ".", "skeema diff")
 	s.dbExec(t, "product", "DROP TABLE `problems`")
 	s.dbExec(t, "product", withClauses)
 	fs.WriteTestFile(t, "mydb/product/problems.sql", withoutClauses)
-	s.handleCommand(t, CodeSuccess, ".", "skeema diff%s", connectOpts)
+	s.handleCommand(t, CodeSuccess, ".", "skeema diff")
 
 	// init strips the clauses when it writes files
 	// (current db state: file still has extra clauses from previous)
@@ -981,12 +994,12 @@ func (s SkeemaIntegrationSuite) TestNonInnoClauses(t *testing.T) {
 	// validation, in either direction
 	newFileContents := strings.Replace(withoutClauses, "  KEY `idx1`", "  newcol int COLUMN_FORMAT FIXED,\n  KEY `idx1`", 1)
 	fs.WriteTestFile(t, "mydb/product/problems.sql", newFileContents)
-	s.handleCommand(t, CodeSuccess, ".", "skeema push%s", connectOpts)
+	s.handleCommand(t, CodeSuccess, ".", "skeema push")
 	s.dbExec(t, "product", "DROP TABLE `problems`")
 	s.dbExec(t, "product", withoutClauses)
 	s.dbExec(t, "product", "ALTER TABLE `problems` DROP KEY `idx2`")
 	fs.WriteTestFile(t, "mydb/product/problems.sql", withClauses)
-	s.handleCommand(t, CodeSuccess, ".", "skeema push%s", connectOpts)
+	s.handleCommand(t, CodeSuccess, ".", "skeema push")
 }
 
 func (s SkeemaIntegrationSuite) TestReuseTempSchema(t *testing.T) {
@@ -1059,7 +1072,11 @@ func (s SkeemaIntegrationSuite) TestShardedSchemas(t *testing.T) {
 	// schema shellouts should also work properly. First get rid of product schema
 	// manually (since push won't ever drop a db) and then push should create
 	// product1 as a new schema.
-	contents = strings.Replace(contents, "schema=product,product2,product3,product4", "schema=`/usr/bin/printf 'product1 product2 product3 product4'`", 1)
+	shelloutSchema := "schema=`/usr/bin/printf 'product1 product2 product3 product4'`"
+	if runtime.GOOS == "windows" {
+		shelloutSchema = "schema=`echo \"product1 product2 product3 product4\"`"
+	}
+	contents = strings.Replace(contents, "schema=product,product2,product3,product4", shelloutSchema, 1)
 	fs.WriteTestFile(t, "mydb/product/.skeema", contents)
 	s.dbExec(t, "", "DROP DATABASE product")
 	s.handleCommand(t, CodeSuccess, ".", "skeema push --ignore-schema=4$")
@@ -1078,7 +1095,7 @@ func (s SkeemaIntegrationSuite) TestShardedSchemas(t *testing.T) {
 	if err := os.RemoveAll("mydb/analytics"); err != nil {
 		t.Fatalf("Unable to delete mydb/analytics/: %s", err)
 	}
-	contents = strings.Replace(contents, "schema=`/usr/bin/printf 'product1 product2 product3 product4'`", "schema=*", 1)
+	contents = strings.Replace(contents, shelloutSchema, "schema=*", 1)
 	fs.WriteTestFile(t, "mydb/product/.skeema", contents)
 	s.handleCommand(t, CodeSuccess, ".", "skeema push --allow-unsafe")
 	s.assertTableExists(t, "product1", "posts", "")
@@ -1158,18 +1175,7 @@ func (s SkeemaIntegrationSuite) TestFlavorConfig(t *testing.T) {
 
 	// Doing init again to new dir mydbnf, confirm no flavor in mydbnf/.skeema
 	inst.ForceFlavor(badFlavor)
-	var extraFlag string
-	if realFlavor.HasDataDictionary() {
-		// Very counter-intuitive, but we need to ensure init is reusing the
-		// cached Instance that has param information_schema_stats_expiry=0 in the
-		// DSN, since that's what "inst" points to! Supplying the flavor on the CLI
-		// won't otherwise affect anything in init except for this one piece of logic
-		// in fs.Dir.InstanceDefaultParams().
-		// Note that supplying flavor on the CLI is undocumented. Behavior changes
-		// may break this test in the future; find a less hacky solution here if so!
-		extraFlag = " --flavor mysql:8.0"
-	}
-	s.handleCommand(t, CodeSuccess, ".", "skeema init --dir mydbnf -h %s -P %d%s", s.d.Instance.Host, s.d.Instance.Port, extraFlag)
+	s.handleCommand(t, CodeSuccess, ".", "skeema init --dir mydbnf -h %s -P %d", s.d.Instance.Host, s.d.Instance.Port)
 	contents := fs.ReadTestFile(t, "mydbnf/.skeema")
 	if strings.Contains(contents, "flavor") {
 		t.Error("Expected init to skip flavor, but it was found")
@@ -1225,8 +1231,10 @@ END`
 	routine1 = strings.Replace(routine1, "BEGIN\n", "BEGIN\r\n", 1)
 	fs.WriteTestFile(t, "mydb/product/routine1.sql", routine1)
 	s.handleCommand(t, CodeSuccess, ".", "skeema diff")
-	cfg = s.handleCommand(t, CodeSuccess, ".", "skeema pull")
-	s.verifyFiles(t, cfg, "../golden/routines")
+	s.handleCommand(t, CodeSuccess, ".", "skeema pull")
+	if newContents := fs.ReadTestFile(t, "mydb/product/routine1.sql"); strings.Contains(newContents, "\r\n") {
+		t.Error("Expected UNIX-style line-ends to be restored after `skeema pull`, but they were not")
+	}
 
 	// Modify the db representation of the routine; diff/push should work, but only
 	// with --allow-unsafe (and not with --safe-below-size)
@@ -1274,7 +1282,7 @@ END`
 		t.Fatal("Unable to locate routine2")
 	} else {
 		var serverSQLMode string
-		db, _ := s.d.Connect("", "")
+		db, _ := s.d.CachedConnectionPool("", "")
 		if err := db.QueryRow("SELECT @@global.sql_mode").Scan(&serverSQLMode); err != nil {
 			t.Fatalf("Unexpected error querying sql_mode: %s", err)
 		}
@@ -1342,7 +1350,7 @@ func (s SkeemaIntegrationSuite) TestTempSchemaBinlog(t *testing.T) {
 
 	getLogPos := func() string {
 		t.Helper()
-		db, err := s.d.Connect("", "")
+		db, err := s.d.CachedConnectionPool("", "")
 		if err != nil {
 			t.Fatalf("Unable to establish connection: %v", err)
 		}
@@ -1377,7 +1385,7 @@ func (s SkeemaIntegrationSuite) TestTempSchemaBinlog(t *testing.T) {
 
 	pos := getLogPos()
 	s.handleCommand(t, CodeSuccess, ".", "skeema init --dir mydb -h %s -P %d", s.d.Instance.Host, s.d.Instance.Port)
-	pos = assertNotLogged(pos)
+	assertNotLogged(pos)
 	s.dbExec(t, "analytics", "ALTER TABLE pageviews DROP COLUMN domain")
 	createRoutine := `CREATE definer=root@localhost FUNCTION routine1(a int,
   b int)
@@ -1406,9 +1414,11 @@ END`
 
 	// Push-related writes should still advance the binlog position
 	s.handleCommand(t, CodeSuccess, ".", "skeema push --temp-schema-binlog=off")
-	pos = assertLogged(pos)
+	assertLogged(pos)
 }
 
+// TestPartitioning covers the diff/push commands' --partitioning option, as
+// well as the pull command's --update-partitioning option.
 func (s SkeemaIntegrationSuite) TestPartitioning(t *testing.T) {
 	s.handleCommand(t, CodeSuccess, ".", "skeema init --dir mydb -h %s -P %d", s.d.Instance.Host, s.d.Instance.Port)
 
@@ -1433,16 +1443,16 @@ func (s SkeemaIntegrationSuite) TestPartitioning(t *testing.T) {
 	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=modify")
 	s.handleCommand(t, CodeBadConfig, "mydb/analytics", "skeema diff --partitioning=invalid")
 
-	// At this point we haven't pushed yet, but pull --partitioning=remove should
-	// leave the file unchanged, regardless of --format vs --skip-format. Here we're
-	// simulating the situation of fs having partitioning but pulling from a dev
-	// environment which does not.
-	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --partitioning=remove")
+	// At this point we haven't pushed yet, but pull should leave the file
+	// unchanged, regardless of --format vs --skip-format. Here we're simulating
+	// the situation of fs having partitioning but pulling from a dev environment
+	// which does not.
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
 	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents != contents2Part {
 		t.Errorf("File contents modified unexpectedly by pull:\n%s", newContents)
 		fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents2Part) // so that subsequent steps proceed normally
 	}
-	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --partitioning=remove --skip-format")
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format")
 	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents != contents2Part {
 		t.Errorf("File contents modified unexpectedly by pull:\n%s", newContents)
 		fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents2Part) // so that subsequent steps proceed normally
@@ -1454,13 +1464,14 @@ func (s SkeemaIntegrationSuite) TestPartitioning(t *testing.T) {
 	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema diff")
 	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=remove")
 
-	// pull --skip-format should keep the file's format unchanged; pull --format
-	// should format it
-	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format")
+	// pull --update-partitioning --skip-format should keep the file's format
+	// unchanged, but just using --update-partitioning without --skip-format should
+	// format properly
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --update-partitioning --skip-format")
 	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents != contents2Part {
 		t.Errorf("File contents modified unexpectedly by pull:\n%s", newContents)
 	}
-	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --update-partitioning")
 	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(newContents, ")\n(PARTITION ") {
 		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
 	}
@@ -1472,17 +1483,24 @@ func (s SkeemaIntegrationSuite) TestPartitioning(t *testing.T) {
 	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema diff --partitioning=modify")
 	// Note: didn't push the above change
 
-	// pull --skip-format shouldn't touch the file, despite the partition list
-	// difference. But normal pull should rewrite it to have 2 partitions.
+	// pull (with or without --skip-format) shouldn't touch the file, despite the
+	// partition list difference, unless --update-partitioning is used
 	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format")
 	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents != contents3Part {
 		t.Errorf("File contents modified unexpectedly by pull:\n%s", newContents)
 		fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents3Part) // so that subsequent steps proceed normally
 	}
 	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents != contents3Part {
+		t.Errorf("File contents modified unexpectedly by pull:\n%s", newContents)
+		fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents3Part) // so that subsequent steps proceed normally
+	}
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --update-partitioning")
 	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); newContents == contents3Part {
 		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
 	}
+	// Note: no test for --update-partitioning --skip-format, as this does not
+	// properly update the partition list yet
 
 	// Rewrite activity.sql to be unpartitioned. This should not show differences
 	// for keep, but should for remove or modify.
@@ -1492,24 +1510,13 @@ func (s SkeemaIntegrationSuite) TestPartitioning(t *testing.T) {
 	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=modify")
 	// Note: didn't push the above change
 
-	// pull should rewrite activity.sql to have 2 partitions, even with --skip-format --partitioning=remove
-	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
-	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(newContents, "PARTITION BY RANGE") {
-		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
-	}
-	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contentsNoPart)
-	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format --partitioning=remove")
-	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(newContents, "PARTITION BY RANGE") {
-		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
-	}
-
 	// Rewrite activity.sql to have 3 partitions, still by range, as well as a new
 	// column. Pushing this with remove should add the new column but remove the
 	// partitioning.
 	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contents3PartPlusNewCol)
 	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=remove")
 	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema push --partitioning=remove")
-	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format")
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format --update-partitioning")
 	newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql")
 	if strings.Contains(newContents, "PARTITION BY") || !strings.Contains(newContents, "somenewcol") {
 		t.Errorf("Previous push did not have intended effect; current table structure: %s", newContents)
@@ -1528,8 +1535,12 @@ func (s SkeemaIntegrationSuite) TestPartitioning(t *testing.T) {
 	s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --partitioning=remove")
 	// Note: didn't push the above change yet
 
-	// pull should restore range partitioning, even with --skip-format
-	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --skip-format")
+	// pull should restore range partitioning only if --update-partitioning is used
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
+	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); strings.Contains(newContents, "RANGE (") {
+		t.Errorf("File contents unexpectedly updated by pull:\n%s", newContents)
+	}
+	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --update-partitioning")
 	if newContents := fs.ReadTestFile(t, "mydb/analytics/activity.sql"); !strings.Contains(newContents, "RANGE (") {
 		t.Errorf("File contents not formatted as expected by pull:\n%s", newContents)
 	}
@@ -1538,7 +1549,7 @@ func (s SkeemaIntegrationSuite) TestPartitioning(t *testing.T) {
 	// Files should be back to initial state.
 	fs.WriteTestFile(t, "mydb/analytics/activity.sql", contentsHashPart)
 	s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema push --partitioning=remove")
-	cfg := s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull")
+	cfg := s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema pull --update-partitioning")
 	s.verifyFiles(t, cfg, "../golden/init")
 
 	// Repartition with 2 partitions and push. Confirm that dropping the table
@@ -1550,4 +1561,55 @@ func (s SkeemaIntegrationSuite) TestPartitioning(t *testing.T) {
 		s.handleCommand(t, CodeDifferencesFound, "mydb/analytics", "skeema diff --allow-unsafe --partitioning=%s", value)
 		s.handleCommand(t, CodeSuccess, "mydb/analytics", "skeema push --allow-unsafe --partitioning=%s", value)
 	}
+}
+
+// TestStripPartitioning covers the --strip-partitioning supported for several
+// commands.
+func (s SkeemaIntegrationSuite) TestStripPartitioning(t *testing.T) {
+	// Partition a table in the db directly
+	s.dbExec(t, "analytics", "ALTER TABLE activity PARTITION BY RANGE (ts) (PARTITION p0 VALUES LESS THAN (1571678000), PARTITION pN VALUES LESS THAN MAXVALUE)")
+
+	assertPartitioned := func() {
+		t.Helper()
+		contents := fs.ReadTestFile(t, "mydb/analytics/activity.sql")
+		if !strings.Contains(contents, "PARTITION BY") {
+			t.Fatalf("Table in filesystem unexpectedly lacks partitioning clause:\n%s", contents)
+		}
+	}
+	assertUnpartitioned := func(cfg *mybase.Config) {
+		t.Helper()
+		s.verifyFiles(t, cfg, "../golden/init")
+	}
+	reinitWithPartitions := func() {
+		t.Helper()
+		if err := os.RemoveAll("mydb"); err != nil {
+			t.Fatalf("Unable to clean directory: %s", err)
+		}
+		s.handleCommand(t, CodeSuccess, ".", "skeema init --dir mydb -h %s -P %d", s.d.Instance.Host, s.d.Instance.Port)
+		assertPartitioned()
+	}
+
+	// test init --strip-partitioning, which should leave files identical to
+	// golden/init/ since the only change made to the DB was the partitioning
+	s.reinitAndVerifyFiles(t, "--strip-partitioning", "../golden/init")
+
+	// Test behavior of format with and without --strip-partitioning
+	reinitWithPartitions()
+	s.handleCommand(t, CodeSuccess, ".", "skeema format")
+	assertPartitioned()
+	cfg := s.handleCommand(t, CodeDifferencesFound, ".", "skeema format --strip-partitioning")
+	assertUnpartitioned(cfg)
+	s.handleCommand(t, CodeSuccess, ".", "skeema format --strip-partitioning") // already stripped so nothing to change
+
+	// Ditto but for lint
+	reinitWithPartitions()
+	s.handleCommand(t, CodeSuccess, ".", "skeema lint")
+	assertPartitioned()
+	cfg = s.handleCommand(t, CodeDifferencesFound, ".", "skeema lint --strip-partitioning")
+	assertUnpartitioned(cfg)
+
+	// Test behavior of skeema pull --strip-partitioning
+	reinitWithPartitions()
+	cfg = s.handleCommand(t, CodeSuccess, ".", "skeema pull --strip-partitioning")
+	assertUnpartitioned(cfg)
 }
